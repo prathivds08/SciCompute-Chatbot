@@ -1,0 +1,8 @@
+#!/bin/bash
+#SBATCH --job-name=energycutoff_100
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=24
+#SBATCH --partition=standard
+#SBATCH --time=01:00:00
+
+mpirun -np 48 -mca coll_hcoll_enable 0 $HOME/qe-6.7/bin/pw.x -npool 1 -in pw.in > pw.out

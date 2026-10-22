@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SciChat — Scientific Computing Assistant</title>
+  <meta name="description" content="AI Assistant orchestrating DFT, DeePMD Training, LAMMPS Molecular Dynamics, and Post-processing Analysis workflows.">
+  
+  <!-- Modern Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="dark-theme">
+  <!-- Background ambient glow effects -->
+  <div class="ambient-glow glow-1"></div>
+  <div class="ambient-glow glow-2"></div>
+  
+  <!-- App Container -->
+  <div class="app-layout">
+    
+    <!-- ============================================================== -->
+    <!-- TOP NAVIGATION BAR                                            -->
+    <!-- ============================================================== -->
+    <header class="top-nav">
+      <div class="nav-brand">
+        <button id="toggle-sidebar-btn" class="icon-btn" title="Toggle Sessions Sidebar" aria-label="Toggle Sessions">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+        <div class="logo-mark">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="url(#logo-gradient)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <defs>
+              <linearGradient id="logo-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#06b6d4" />
+                <stop offset="100%" stop-color="#8b5cf6" />
+              </linearGradient>
+            </defs>
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M12 2v2"></path><path d="M12 20v2"></path>
+            <path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path>
+            <path d="M2 12h2"></path><path d="M20 12h2"></path>
+            <path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <span class="brand-name">SciChat</span>
+          <span class="brand-tag">Scientific RAG Orchestrator</span>
+        </div>
+      </div>
+
+      <!-- Center status pill & Mode Switcher -->
+      <div class="nav-center">
+        <div class="mode-toggle-group" id="mode-toggle-group" title="Select evaluation agent mode">
+          <button class="mode-toggle-btn active" data-mode="rag" id="mode-rag-btn">⚡ Agentic RAG</button>
+          <button class="mode-toggle-btn" data-mode="baseline" id="mode-baseline-btn">🎯 Zero-Shot Baseline</button>
+        </div>
+        <div class="status-pill" id="backend-status-pill">
+          <span class="status-dot pulse" id="status-indicator"></span>
+          <span class="status-label" id="backend-status-text">Connecting...</span>
+          <span class="status-badge" id="model-badge">qwen2.5-coder:7b</span>
+        </div>
+      </div>
+
+      <!-- Right actions -->
+      <div class="nav-actions">
+        <div class="stat-pill" title="VectorDB Ingested Chunks">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+            <polyline points="2 17 12 22 22 17"></polyline>
+            <polyline points="2 12 12 17 22 12"></polyline>
+          </svg>
+          <span id="chunks-stat">0</span> chunks
+        </div>
+
+        <div class="stat-pill" id="docker-status-pill" title="Docker Container Sandbox Status">
+          <span style="font-size: 13px;">🐳</span>
+          <span id="docker-status-text">Docker: Offline</span>
+        </div>
+
+        <button id="reindex-btn" class="nav-btn" title="Re-index Knowledge Graph & Vector Store">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+          </svg>
+          <span>Sync Knowledge</span>
+        </button>
+
+        <button id="toggle-drawer-btn" class="nav-btn highlight" title="Toggle Jobs & Knowledge Inspector" aria-label="Toggle Inspector">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="9" y1="3" x2="9" y2="21"></line>
+          </svg>
+          <span>Inspector</span>
+          <span class="badge-dot" id="jobs-badge-dot"></span>
+        </button>
+      </div>
+    </header>
+
+    <!-- ============================================================== -->
+    <!-- MAIN WORKSPACE                                                 -->
+    <!-- ============================================================== -->
+    <div class="workspace-body">
+      
+      <!-- LEFT SIDEBAR: Sessions & Workflows -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-top">
+          <button id="new-chat-btn" class="btn btn-primary btn-full">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+            <span>New Simulation Session</span>
+          </button>
+        </div>
+
+        <!-- Domain Filter Chips -->
+        <div class="sidebar-section">
+          <div class="section-title">Workflows</div>
+          <div class="domain-filters" id="domain-filters">
+            <button class="filter-chip active" data-domain="all">
+              <span class="chip-icon">🌐</span> All Workflows
+            </button>
+            <button class="filter-chip" data-domain="dft">
+              <span class="chip-icon">⚛️</span> DFT (QE)
+            </button>
+            <button class="filter-chip" data-domain="training">
+              <span class="chip-icon">🏋️</span> DeePMD Training
+            </button>
+            <button class="filter-chip" data-domain="md">
+              <span class="chip-icon">🔬</span> LAMMPS MD
+            </button>
+            <button class="filter-chip" data-domain="analysis">
+              <span class="chip-icon">📊</span> Trajectory Analysis
+            </button>
+          </div>
+        </div>
+
+        <!-- Session History List -->
+        <div class="sidebar-section sessions-section">
+          <div class="section-header">
+            <span class="section-title">Session History</span>
+            <span class="session-count" id="session-count-label">0</span>
+          </div>
+          <div class="session-list" id="session-list">
+            <!-- Dynamic session items inserted here -->
+            <div class="empty-sessions">No sessions found</div>
+          </div>
+        </div>
+
+        <div class="sidebar-footer">
+          <div class="workspace-pill" title="Active Project Workspace">
+            <span class="folder-icon">📁</span>
+            <span class="workspace-name">Chatbox_for_analysis_AL</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ============================================================== -->
+      <!-- CHAT STAGE (Central Conversation Area)                         -->
+      <!-- ============================================================== -->
+      <main class="chat-stage" id="chat-stage">
+        
+        <!-- Scrollable Messages Container -->
+        <div class="messages-container" id="messages-container">
+          
+          <!-- Hero greeting (Shown when current session is empty) -->
+          <div class="hero-screen" id="hero-screen">
+            <div class="hero-icon-ring">
+              <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="url(#hero-gradient)" stroke-width="1.8">
+                <defs>
+                  <linearGradient id="hero-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#06b6d4" />
+                    <stop offset="50%" stop-color="#3b82f6" />
+                    <stop offset="100%" stop-color="#8b5cf6" />
+                  </linearGradient>
+                </defs>
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M12 2v2"></path><path d="M12 20v2"></path>
+                <path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path>
+                <path d="M2 12h2"></path><path d="M20 12h2"></path>
+                <path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path>
+              </svg>
+            </div>
+            
+            <h1 class="hero-title">Scientific Computing Assistant</h1>
+            <p class="hero-subtitle">
+              Orchestrate materials modeling workflows powered by local LLM reasoning, ChromaDB vector search, and Kùzu graph knowledge.
+            </p>
+
+            <!-- Quick Start Starter Prompts -->
+            <div class="starter-grid">
+              <button class="starter-card" data-prompt="What is the convergence testing workflow for DFT and what material is it setup for?">
+                <div class="starter-header">
+                  <span class="starter-icon">⚛️</span>
+                  <span class="starter-tag">DFT / QE</span>
+                </div>
+                <div class="starter-title">Convergence Testing Workflow</div>
+                <div class="starter-desc">Ask about ecutwfc, k-points, and pseudopotentials for Pt.</div>
+              </button>
+
+              <button class="starter-card" data-prompt="What dataset structure does DeePMD-kit require and how do we convert raw files into training sets?">
+                <div class="starter-header">
+                  <span class="starter-icon">🏋️</span>
+                  <span class="starter-tag">DeePMD Training</span>
+                </div>
+                <div class="starter-title">Training Data Preparation</div>
+                <div class="starter-desc">Explain raw format, set.* directories, and input.json generation.</div>
+              </button>
+
+              <button class="starter-card" data-prompt="How do we configure a LAMMPS molecular dynamics run using a trained DeePMD neural network potential?">
+                <div class="starter-header">
+                  <span class="starter-icon">🔬</span>
+                  <span class="starter-tag">Molecular Dynamics</span>
+                </div>
+                <div class="starter-title">LAMMPS + DeePMD Setup</div>
+                <div class="starter-desc">Review pair_style deepmd syntax, restart batches, and NVT/NPT ensembles.</div>
+              </button>
+
+              <button class="starter-card" data-prompt="How does the post-processing analysis compute density profiles and radial distribution functions (RDF)?">
+                <div class="starter-header">
+                  <span class="starter-icon">📊</span>
+                  <span class="starter-tag">Analysis</span>
+                </div>
+                <div class="starter-title">Trajectory Analysis</div>
+                <div class="starter-desc">Learn about Pt-O interfacial RDF, water density, and survival probability.</div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Messages list rendered by app.js -->
+          <div class="message-feed" id="message-feed"></div>
+
+          <!-- Typing indicator -->
+          <div class="typing-bubble" id="typing-indicator" style="display: none;">
+            <div class="agent-avatar">
+              <span class="avatar-icon">🤖</span>
+            </div>
+            <div class="typing-content">
+              <div class="typing-dots">
+                <span></span><span></span><span></span>
+              </div>
+              <span class="typing-text">Retrieving domain knowledge & reasoning...</span>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- BOTTOM INPUT DOCK                                            -->
+        <!-- ============================================================ -->
+        <div class="input-dock-container">
+          <div class="input-dock">
+            <div class="input-wrapper">
+              <textarea 
+                id="chat-input" 
+                class="chat-textarea" 
+                placeholder="Ask about DFT convergence, DeePMD training, LAMMPS MD, or trajectory analysis..."
+                rows="1"
+                aria-label="Message Input"
+              ></textarea>
+              
+              <div class="input-controls">
+                <button id="clear-chat-btn" class="icon-control-btn" title="Clear / New Chat" aria-label="Clear chat">
+                  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                  </svg>
+                </button>
+                <button id="send-btn" class="send-btn" title="Send Message (Enter)" aria-label="Send Message">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <line x1="22" y1="2" x2="11" y2="13"></line>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <div class="input-hints">
+              <span>Press <kbd>Enter</kbd> to send, <kbd>Shift + Enter</kbd> for newline</span>
+              <span class="hint-pill">Agentic RAG Active</span>
+            </div>
+          </div>
+        </div>
+
+      </main>
+
+      <!-- ============================================================== -->
+      <!-- RIGHT INSPECTOR DRAWER                                         -->
+      <!-- ============================================================== -->
+      <aside class="inspector-drawer" id="inspector-drawer">
+        <div class="drawer-header">
+          <div class="drawer-tabs" role="tablist">
+            <button class="drawer-tab active" data-tab="jobs" role="tab" id="tab-jobs">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
+                <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+              </svg>
+              <span>Jobs</span>
+            </button>
+            <button class="drawer-tab" data-tab="knowledge" role="tab" id="tab-knowledge">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="18" cy="5" r="3"></circle>
+                <circle cx="6" cy="12" r="3"></circle>
+                <circle cx="18" cy="19" r="3"></circle>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+              </svg>
+              <span>Knowledge</span>
+            </button>
+            <button class="drawer-tab" data-tab="cheatsheet" role="tab" id="tab-cheatsheet">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                <polyline points="14 2 14 8 20 8"></polyline>
+                <line x1="16" y1="13" x2="8" y2="13"></line>
+                <line x1="16" y1="17" x2="8" y2="17"></line>
+                <polyline points="10 9 9 9 8 9"></polyline>
+              </svg>
+              <span>Cheatsheet</span>
+            </button>
+          </div>
+          <button id="close-drawer-btn" class="icon-btn-sm" title="Close Drawer" aria-label="Close Drawer">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+
+        <div class="drawer-content">
+          <!-- TAB 1: Simulation Jobs -->
+          <div class="drawer-pane active" id="pane-jobs">
+            <div class="pane-action-bar">
+              <span class="pane-subheading">Tracked SLURM / Local Tasks</span>
+              <button id="refresh-jobs-btn" class="icon-btn-xs" title="Refresh Jobs">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+                </svg>
+              </button>
+            </div>
+
+            <div class="jobs-list" id="jobs-list">
+              <div class="empty-state-card">
+                <div class="empty-icon">⏳</div>
+                <div class="empty-title">No Active Simulations</div>
+                <div class="empty-text">Jobs launched via DFT, DeePMD, or LAMMPS tools will appear here in real-time.</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: Knowledge & Graph DB -->
+          <div class="drawer-pane" id="pane-knowledge">
+            <div class="knowledge-stats-grid">
+              <div class="stat-card">
+                <div class="stat-num" id="stat-vector-count">0</div>
+                <div class="stat-label">ChromaDB Chunks</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-num" id="stat-kg-entities">0</div>
+                <div class="stat-label">Kùzu Graph Entities</div>
+              </div>
+            </div>
+
+            <div class="knowledge-section">
+              <div class="section-title">Knowledge Architecture</div>
+              <div class="kg-entity-list" id="kg-entity-details">
+                <div class="kg-item">
+                  <span class="kg-type">Vector Store</span>
+                  <span class="kg-desc">Project READMEs & manuals embedded with <code>nomic-embed-text</code></span>
+                </div>
+                <div class="kg-item">
+                  <span class="kg-type">Knowledge Graph</span>
+                  <span class="kg-desc">Kùzu DB schema: Material, Pseudopotential, System, Step, Trajectory</span>
+                </div>
+                <div class="kg-item">
+                  <span class="kg-type">Relational DB</span>
+                  <span class="kg-desc">SQLite session logs, message store & SLURM jobs</span>
+                </div>
+              </div>
+            </div>
+
+            <button id="trigger-reindex-btn" class="btn btn-secondary btn-full">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+              </svg>
+              <span>Force Re-ingest Documentation</span>
+            </button>
+          </div>
+
+          <!-- TAB 3: Cheatsheet -->
+          <div class="drawer-pane" id="pane-cheatsheet">
+            <div class="cheatsheet-item">
+              <div class="cheatsheet-title">⚛️ DFT / Quantum ESPRESSO</div>
+              <p>Key parameters for Platinum convergence sweeps:</p>
+              <code>ecutwfc: 50–120 Ry<br>kpoints: 4x4x4 to 12x12x12<br>pseudo: Pt.pbe-n-kjpaw_psl.1.0.0.UPF</code>
+            </div>
+
+            <div class="cheatsheet-item">
+              <div class="cheatsheet-title">🏋️ DeePMD-kit Training</div>
+              <p>Raw format must include box.raw, coord.raw, energy.raw, force.raw, type.raw.</p>
+              <code>dp train input.json<br>dp freeze -o graph.pb</code>
+            </div>
+
+            <div class="cheatsheet-item">
+              <div class="cheatsheet-title">🔬 LAMMPS MD</div>
+              <p>Neural potential pair style configuration:</p>
+              <code>pair_style deepmd graph.pb<br>pair_coeff * *</code>
+            </div>
+
+            <div class="cheatsheet-item">
+              <div class="cheatsheet-title">📊 Interfacial Analysis</div>
+              <p>Common post-processing scripts:</p>
+              <code>Density profile along z-axis (bin: 0.1 Å)<br>Radial Distribution Function g(r) for Pt-O and O-O<br>Interfacial residence / survival probability P(t)</code>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

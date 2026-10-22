@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data and database directories (these contain locked SQLite/WAL files and large datasets)
+data/
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+*.extxyz
+*.npy
+*.raw
+*.pb
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE and Git
+.git/
+.github/
+.vscode/
+.idea/
+.gemini/
+.agents/
+
+# Logs and tests
+*.log
+.pytest_cache/

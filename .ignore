@@ -1,0 +1,11 @@
+# Search and AI Model Ignore List
+backend/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz
+backend/data/*.extxyz
+*.extxyz
+*.npy
+*.raw
+*.pb
+backend/data/chromadb/
+backend/data/kuzu_db*
+backend/data/chatbox.db*
+backend/data/sandbox/

@@ -1,0 +1,36 @@
+plugin load     libdeepmd_lmp.so
+
+units           metal
+
+boundary        p p p
+
+atom_style      atomic
+
+neighbor        2.0 bin
+
+neigh_modify    every 10 delay 0 check no
+
+read_restart    ../batch_7/lammps.restart
+
+mass            1 2.014
+mass            2 15.999
+
+pair_style deepmd ../../../Frozen_Graphs/DPMD_Water/1/graph1.pb ../../../Frozen_Graphs/DPMD_Water/2/graph2.pb ../../../Frozen_Graphs/DPMD_Water/3/graph3.pb out_file md.out out_freq 100
+
+pair_coeff      * *
+
+fix             1 all nvt temp 300 300 0.1
+
+timestep        0.0005
+
+thermo_style    custom step pe ke etotal temp press vol
+
+thermo          100
+
+dump            1 all dcd 100 DPMD_Water_batch_8.dcd
+
+timer timeout   04:00:00 every 100
+
+run             1000000
+
+write_restart   lammps.restart

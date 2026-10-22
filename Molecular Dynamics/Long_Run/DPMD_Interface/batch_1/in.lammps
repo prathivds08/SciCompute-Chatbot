@@ -1,0 +1,56 @@
+variable        TEMP            equal 330
+variable        NSTEPS          equal 1000000
+variable        THERMO_FREQ     equal 100
+variable        DUMP_FREQ       equal 1
+variable        dt              equal 0.0005
+variable        TAU_T           equal 100*${dt}
+variable        restart         equal 0
+
+units           metal
+boundary        p p p
+atom_style      atomic
+
+read_data       ../../Starting_Configurations/Graphene_Water_DPMD_Validation_file.lmp
+
+mass            1 15.999000
+mass            2 1.00794
+mass            3 12.0107
+
+pair_style deepmd ../../../Frozen_Graphs/DPMD_Interface/1/graph1.pb ../../../Frozen_Graphs/DPMD_Interface/2/graph2.pb ../../../Frozen_Graphs/DPMD_Interface/3/graph3.pb out_file md.out out_freq 100
+pair_coeff      * *
+
+neighbor        1.0 bin
+timestep        ${dt}
+thermo          ${THERMO_FREQ}
+thermo_style    custom step temp pe ke etotal pxx pyy pzz press vol density
+thermo_modify   line multi
+
+velocity        all create ${TEMP} 73294324 dist gaussian
+fix             mzero all momentum 1000 linear 1 1 1
+fix             1 all nvt temp ${TEMP} ${TEMP} ${TAU_T}
+run             5000
+unfix           1
+
+variable s equal step
+variable t equal temp
+variable pe equal pe
+variable ke equal ke
+variable et equal etotal
+variable pxx equal pxx
+variable pyy equal pyy
+variable pzz equal pzz
+variable press equal press
+variable vol equal vol
+variable rho equal density
+fix myOutput all print ${THERMO_FREQ} "${s} ${t} ${pe} ${ke} ${et} ${pxx} ${pyy} ${pzz} ${press} ${vol} ${rho}" file thermo_output.txt screen no
+
+fix             2 all nvt temp ${TEMP} ${TEMP} ${TAU_T}
+run             100000
+unfix           2
+
+fix             3 all nvt temp ${TEMP} ${TEMP} ${TAU_T}
+dump            1 all custom ${DUMP_FREQ} water.lammpstrj id type x y z
+dump_modify     1 sort id
+timer timeout   04:00:00 every 100
+run             ${NSTEPS}
+write_restart   lammps.restart

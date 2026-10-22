@@ -1,0 +1,16 @@
+# Gemini / Antigravity Model Ignore File
+# Prevents AI models from reading, indexing, or ingesting raw dataset files into prompt context.
+
+# Raw trajectory and coordinate dataset files
+backend/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz
+backend/data/*.extxyz
+*.extxyz
+*.npy
+*.raw
+*.pb
+
+# Databases and cache
+backend/data/chromadb/
+backend/data/kuzu_db*
+backend/data/chatbox.db*
+backend/data/sandbox/

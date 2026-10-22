@@ -1,0 +1,48 @@
+# ==============================================================================
+# Dockerfile for Isolated DeePMD & Interfacial Scientific Analysis Sandbox
+# ==============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="SciChat Lab"
+LABEL description="Sandboxed execution container for DeePMD and interfacial water analysis"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg \
+    PYTHONIOENCODING=utf-8
+
+# Install essential system libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    libopenblas-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install scientific and DeePMD analysis stack
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+    numpy \
+    scipy \
+    matplotlib \
+    ase \
+    pandas \
+    deepmd-kit
+
+# Create application directories
+# /workspace is mounted from the run directory (read-write)
+# /data is mounted from backend/data (read-only)
+RUN mkdir -p /workspace /data && \
+    chmod 777 /workspace /data
+
+# Add unprivileged runtime user for execution security
+RUN useradd -m -u 1000 -s /bin/bash scicoder && \
+    chown -R scicoder:scicoder /workspace /data
+
+USER scicoder
+WORKDIR /workspace
+
+CMD ["python", "--version"]

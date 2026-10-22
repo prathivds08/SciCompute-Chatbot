@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  deepmd-sandbox:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.deepmd
+    image: deepmd-analysis-sandbox:latest
+    container_name: deepmd-analysis-sandbox
+    network_mode: none
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+    volumes:
+      - ../backend/data:/data:ro
+      - ../backend/data/sandbox:/workspace:rw
+    environment:
+      - MPLBACKEND=Agg
+      - PYTHONUNBUFFERED=1
+    command: ["python", "--version"]
