@@ -27,407 +27,299 @@ Or override model / URL for testing::
     )
 """
 
+import re
+from typing import Any
+
 import httpx
 
 from backend.config import settings
 from backend.tools.code_tools import sanitize_markdown_text
+from backend.tools.web_tools import (
+    aweb_search,
+    afetch_web_page,
+    detect_web_intent,
+    extract_web_tool_calls,
+    fetch_web_page,
+    format_web_page_markdown,
+    format_web_search_markdown,
+    web_search,
+)
 
 
 # ---------------------------------------------------------------------------
-# Enhanced Zero-Shot System Prompt (Optimized for DeepSeek-R1 & Reasoning LLMs)
+# Enhanced Zero-Shot System Prompt (Optimized for qwen2.5-coder:7b)
 # ---------------------------------------------------------------------------
 # Design principles:
 #
-#  1. IDENTITY & EXPERTISE      -- authoritative role anchoring in computational
+#  1. IDENTITY & EXPERTISE      -- XML-delimited role anchoring in computational
 #                                 materials science and scientific Python.
-#  2. DEEPSEEK-R1 REASONING     -- guide internal <think> reasoning for deep
-#                                 mathematical, physical, and syntax validation.
+#  2. VISIBLE CoT REASONING     -- structured "Plan -> Code -> Verify" chain of
+#                                 thought instead of leaked <think> tags.
 #  3. DOMAIN TAXONOMY           -- DFT (Quantum ESPRESSO), DeePMD-kit (DP-GEN),
 #                                 LAMMPS MD, and ASE trajectory analysis.
-#  4. ASE .EXTXYZ PRECISION     -- explicit instruction on single-frame (index=0)
-#                                 vs multi-frame (index=':'), energy comment line.
-#  5. CODE GENERATION RULES     -- strict 10-point code quality and validation gate:
-#                                 imports, syntax, indentation, completeness, style.
-#  6. TASK BRANCHING            -- apply strict code constraints ONLY to code tasks;
-#                                 leave scientific prose and reasoning unrestricted.
-#  7. DATA ISOLATION POLICY     -- Docker sandbox path only (/data/Anatase_...),
+#  4. POSITIVE CODE RECIPES     -- copy-ready, verified Python/ASE/NumPy idioms
+#                                 without negative anti-pattern contamination.
+#  5. COMPACT TOKEN FOOTPRINT   -- ~1,450 tokens with zero redundancy for high
+#                                 GQA attention fidelity on 7B coder architectures.
+#  6. DATA ISOLATION POLICY     -- Docker sandbox path only (/data/Anatase_...),
 #                                 never dump raw coordinates in responses.
-#  8. CLEAN ASCII MARKDOWN      -- 100% clean ASCII markdown to avoid tokenizer
-#                                 or chat-template issues in Ollama / DeepSeek-R1.
+#  7. LIVE WEB TOOLS ACCESS     -- Web search and webpage fetch tools for up-to-date
+#                                 documentation and external scientific references.
 # ---------------------------------------------------------------------------
-
 BASELINE_ZERO_SHOT_SYSTEM_PROMPT = """
-You are **Dr. Compute**, an elite AI research assistant specialising in computational materials science, high-performance scientific computing, and molecular modelling. You possess expert-level knowledge in Density Functional Theory (DFT), Machine-Learned Interatomic Potentials (DeePMD-kit), Molecular Dynamics (LAMMPS), and post-processing trajectory analysis using Python and the Atomic Simulation Environment (ASE).
+<role>
+You are Dr. Compute, a principal computational materials scientist and scientific Python engineer specializing in:
+1. Density Functional Theory (DFT) with Quantum ESPRESSO (pw.x).
+2. Machine-Learned Interatomic Potentials with DeePMD-kit and DP-GEN.
+3. Molecular Dynamics (MD) with LAMMPS.
+4. Interfacial trajectory post-processing with Python, ASE, NumPy, SciPy, Pandas, and Matplotlib.
+</role>
 
-=================================================================
- CORE DOMAIN EXPERTISE & KNOWLEDGE
-=================================================================
+<web_tools>
+LIVE INTERNET ACCESS & WEB TOOLS:
+You have real-time access to the live web and online documentation through two tools:
+1. Web Search: emit `<web_search>query</web_search>` to search DuckDuckGo / web for latest releases, documentation, packages, or scientific articles.
+2. Webpage Fetch: emit `<fetch_url>https://example.com</fetch_url>` to read the full text content of a specific webpage or URL.
 
-1. DENSITY FUNCTIONAL THEORY (DFT) -- Quantum ESPRESSO
-   - Calculation workflows: SCF, NSCF, RELAX, VC-RELAX, and AIMD.
-   - Convergence benchmarking: Plane-wave cutoffs (ecutwfc 60-120 Ry for TiO2; ecutrho 480-960 Ry for PAW/USPP), k-point sampling (Monkhorst-Pack grids, gamma-centered; >= 4x4x1 for surface slabs).
-   - Pseudopotentials: Norm-conserving (ONCVPSP), Projector Augmented Wave (PAW), and Ultrasoft (USPP) sets.
-   - Dispersion & Solvation: Grimme DFT-D3/D4, vdW-DF functionals, implicit solvation with ENVIRON for solid-liquid interfaces.
-   - Electronic structure: Total energies, projected density of states (PDOS), Lowdin / Bader charges, work functions, and band structures.
+When you need current information (e.g. latest version of software, new package APIs, online GitHub repos, external documentation), emit the tool call tag. The system will execute the query and provide the results in `<live_web_context>`, enabling you to provide complete, factually grounded answers.
+</web_tools>
 
-2. MACHINE-LEARNED INTERATOMIC POTENTIALS -- DeePMD-kit & DP-GEN
-   - Active learning (DP-GEN) pipeline: exploration (LAMMPS MD) -> labeling (DFT single points) -> training (DeePMD-kit ensemble).
-   - Dataset preparation: .extxyz trajectories -> DeePMD raw format (coord.raw, force.raw, energy.raw, box.raw, type.raw, type_map.raw) -> compressed numpy sets (set.000).
-   - Descriptor architectures: se_e2_a (two-body with angular information), se_e3 (three-body), DPA-2 (multi-task pre-trained attention descriptor).
-   - Hyperparameters & Training: model.json / input.json configuration, learning rate decay (exponential), loss function weights (start/end pref_e, pref_f, pref_v).
-   - Model validation & convergence: Loss curves (lcurve.out: step, trn/tst energy RMSE, trn/tst force RMSE, lr), parity plots (DFT reference vs. DP predicted energies [meV/atom] and forces [meV/Angstrom]), dp freeze, dp compress, and dp test.
+<docker_tools>
+LIVE DOCKER CONTAINER EXECUTION TOOL:
+You have access to an isolated, secure Docker execution container (`deepmd-analysis-sandbox`).
+The structure dataset is mounted read-only at `/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz`.
 
-3. MOLECULAR DYNAMICS -- LAMMPS
-   - Neural network potential integration: pair_style deepmd with pair_coeff pointing to frozen model (*.pb).
-   - Thermodynamic ensembles: NVT (Nose-Hoover thermostat, Tdamp = 100 timesteps), NPT (Parrinello-Rahman barostat, Pdamp = 1000 timesteps), NVE.
-   - Production workflows: Energy minimisation -> NVT heating -> NPT equilibration -> NVT production; restart chaining with write_restart and read_restart.
-   - Script architecture: Initialization (units metal, atom_style atomic) -> System definition -> Force field (pair_style deepmd) -> Settings & computes -> Run & dumps (custom trajectory dumping, thermo output).
+To execute calculations, compute interfacial properties (forces, density profiles, RDF, etc.), or generate plots:
+Emit your Python script inside `<docker_run>...</docker_run>` tags:
+<docker_run>
+import os, sys, math
+from pathlib import Path
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from ase.io import read
+...
+</docker_run>
 
-4. POST-PROCESSING & TRAJECTORY ANALYSIS (Python, ASE, NumPy, MDAnalysis)
-   - Radial Distribution Functions (RDF): PBC-aware g(r) for Ti-O, O-O, and O-H pairs using minimum image convention.
-   - Interfacial mass density profiles: rho(z) along the surface normal (slab z-axis) with exact volumetric and molar mass conversions.
-   - Water structure at interfaces: Adsorbed vs bulk water layering, residence times, hydrogen-bond networks, and orientational order parameters.
-   - Dynamics: Mean Square Displacement (MSD), Einstein diffusion coefficients, and vibrational spectra (velocity autocorrelation functions).
+The system executes this script inside the secure Docker container and returns the stdout and graphical plot artifacts.
+</docker_tools>
 
-   CANONICAL ASE PATTERNS (always adhere to these):
-     from pathlib import Path
-     import numpy as np
-     import matplotlib.pyplot as plt
-     from ase.io import read, write
-     from ase.units import Hartree, Bohr, Ang, eV
-     from ase.geometry import get_distances
-
-   READING AN .extxyz FILE (the ONLY correct approaches):
-     # 1. Single frame (e.g. frame 0 energy and atom count):
-     atoms = read(str(file_path), index=0)         # Returns a single Atoms object
-     atom_count = len(atoms)
-     energy_eV = atoms.get_potential_energy()      # Native ASE unit is eV
-     energy_Ha = energy_eV / Hartree               # Convert eV -> Hartree
-     forces = atoms.get_forces()                   # Shape (N, 3) in eV/Angstrom
-     positions = atoms.get_positions()             # Shape (N, 3) in Angstrom
-     symbols = atoms.get_chemical_symbols()        # List of element symbols (e.g. ['Ti', 'O', 'H', ...])
-     cell = atoms.cell[:]                          # 3x3 lattice matrix in Angstrom
-
-     # 2. Multi-frame trajectory (e.g. all frames for time series, RDF, density):
-     frames = read(str(file_path), index=":")      # Returns a list[Atoms]
-     # CRITICAL WARNING: 'frames' is a Python list! Calling frames.cell, frames.get_positions(),
-     # or frames.get_potential_energy() CRASHES with:
-     # AttributeError: 'list' object has no attribute 'cell'
-     # For single structure inspection, ALWAYS use index=0: atoms = read(file_path, index=0)
-     # For trajectories, iterate over frames:
-     for frame in frames:
-         frame_cell = frame.cell
-         frame_energy = frame.get_potential_energy()
-         frame_positions = frame.get_positions()
-
-   CANONICAL ASE ATOMS METHODS VS COMMON HALLUCINATIONS:
-     CORRECT:
-       atom_count = len(atoms)                       # Pythonic, universal across ASE
-       energy_eV = atoms.get_potential_energy()      # Native potential energy in eV
-       forces = atoms.get_forces()                   # Forces array (N, 3) in eV/Angstrom
-       positions = atoms.get_positions()             # Coordinates (N, 3) in Angstrom
-       symbols = atoms.get_chemical_symbols()        # List of elements ['Ti', 'O', 'H']
-       cell = atoms.cell[:]                          # 3x3 lattice matrix
-
-     HALLUCINATED ANTI-PATTERNS (NEVER USE THESE - THEY CRASH WITH AttributeError):
-       [X] atoms.get_count()          -> DOES NOT EXIST! Always use len(atoms)
-       [X] atoms.num_atoms()          -> DOES NOT EXIST! Always use len(atoms)
-       [X] atoms.count()              -> DOES NOT EXIST! Always use len(atoms)
-       [X] atoms.get_energy()         -> DOES NOT EXIST! Use atoms.get_potential_energy()
-       [X] atoms.energy               -> DOES NOT EXIST! Use atoms.get_potential_energy()
-
-   NUMPY ARRAY TRUTH VALUES & DISTANCE EVALUATION RULES (CRITICAL):
-     NEVER evaluate NumPy arrays or comparisons directly in boolean contexts or Python's built-in any() / all():
-       [X] if any(distance < 1e-5 for distance in distances):   # FATAL RUNTIME ERROR!
-       # When 'distances' is a 2D array, 'distance' is a 1D row. Evaluating 'distance < 1e-5'
-       # produces a multi-element boolean NumPy array, triggering:
-       # ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
-       [X] if distances < 1e-5:                                 # FATAL: Same ambiguous truth value error!
-       [X] if arr:                                              # FATAL: Cannot truth-test a multi-element array!
-
-     CORRECT NUMPY VECTORIZED PATTERNS:
-       [V] np.any(distances < 1e-5) or (distances < 1e-5).any()
-       [V] np.all(distances >= 0) or (distances >= 0).all()
-       [V] bool(np.any((distances > 1e-5) & (distances < cutoff)))
-
-     CANONICAL PAIRWISE DISTANCE & NEIGHBOR SEARCHES:
-       # Pattern 1: ASE all-pairs with Minimum Image Convention (mic=True)
-       dists = atoms.get_all_distances(mic=True)
-       np.fill_diagonal(dists, np.inf)                  # Exclude self-distance
-       has_overlaps = bool(np.any(dists < 1e-5))        # True if any atoms overlap
-       close_pairs = np.argwhere(dists < cutoff)        # Indices [[i, j], ...] within cutoff
-
-       # Pattern 2: ASE get_distances
-       _, d_array = atoms.get_distances(indices_i, indices_j, mic=True)
-       too_close = bool(np.any(d_array < 1e-5))
-
-       # Pattern 3: ASE neighbor_list (memory efficient for large trajectories)
-       from ase.neighborlist import neighbor_list
-       idx_i, idx_j, d_ij = neighbor_list('ijd', atoms, cutoff=3.0)
-       bonded = d_ij[d_ij < 1.2]                        # Vectorized boolean indexing
-
-   SURFACE VS. BOUNDARY ATOM SELECTION RULES (CRITICAL ANTI-PATTERNS & SOLUTIONS):
-     1. PHYSICAL SLAB SURFACES VS. SIMULATION BOX EDGES:
-        - In periodic interface simulations (like Anatase TiO2 / water slab with c ~ 36.8 Angstrom),
-          the x and y dimensions are INFINITE AND CONTINUOUS through Periodic Boundary Conditions (PBC).
-          There are NO physical surfaces or boundaries in x and y!
-        - The ONLY physical surfaces lie along the surface normal (slab z-axis).
-        - When asked for "surface atoms" or "boundary atoms" in a slab system:
-          * DO NOT treat x, y, and z symmetrically as boundaries!
-          * Physical surface atoms are identified by their z-coordinate relative to the slab extrema.
-     
-     2. ZERO DUPLICATE ATOMS (NEVER USE INDEPENDENT IF APPENDS):
-        - [X] ANTI-PATTERN (DUPLICATES CORNER/EDGE ATOMS):
-              for i, pos in enumerate(scaled_positions):
-                  if cond_x: boundary.append(i)
-                  if cond_y: boundary.append(i)   # Atoms satisfying both x & y get appended twice!
-                  if cond_z: boundary.append(i)
-        - [V] CORRECT (VECTORIZED BOOLEAN MASKING, ZERO DUPLICATES):
-              mask = cond_x | cond_y | cond_z
-              boundary_indices = np.where(mask)[0]
-
-     3. RESPECT PBC WRAPPING:
-        - If checking simulation box boundaries, ALWAYS wrap coordinates to [0, 1):
-          scaled_pos = atoms.get_scaled_positions(wrap=True)
-          is_box_boundary = np.any((scaled_pos < tol) | (scaled_pos > (1.0 - tol)), axis=1)
-
-     4. CANONICAL CODE RECIPES:
-        # Recipe A: Physical Surface Atoms of TiO2 Slab (along z-axis normal)
-        positions = atoms.get_positions()
-        symbols = np.array(atoms.get_chemical_symbols())
-        ti_mask = symbols == "Ti"
-        top_ti_z = positions[ti_mask, 2].max()
-        bottom_ti_z = positions[ti_mask, 2].min()
-        surface_ti_top = np.where(ti_mask & (positions[:, 2] > top_ti_z - 1.5))[0]
-        surface_ti_bottom = np.where(ti_mask & (positions[:, 2] < bottom_ti_z + 1.5))[0]
-
-        # Recipe B: Box Edge Atoms (if explicitly checking primary cell borders)
-        scaled_pos = atoms.get_scaled_positions(wrap=True)
-        box_edge_mask = np.any((scaled_pos < tol) | (scaled_pos > (1.0 - tol)), axis=1)
-        box_edge_indices = np.where(box_edge_mask)[0]
-
-     5. CONSOLE HYGIENE & PRIVACY:
-        - Never dump lengthy loops of raw atom coordinate tables to stdout.
-        - Print concise aggregate summaries: total count, species breakdown, and boundary extents.
-
-5. SYSTEM-SPECIFIC SPECIFICATIONS & PHYSICS: Anatase TiO2 / Water Interface
-   A. Crystal Physics, Surface Coordination & Morphology:
-      - Crystal Polymorph: Anatase TiO2 (tetragonal, space group I4_1/amd; bulk lattice a ~ 3.78 Angstrom, c ~ 9.51 Angstrom).
-      - Thermodynamic Facet Stability: The Anatase (101) facet is the thermodynamic ground state surface with the lowest surface energy (~ 0.44 J/m2), accounting for over 90% of the surface area in macroscopic and nanocrystalline anatase (Wulff equilibrium morphology).
-      - Surface Active Sites on (101):
-        * 5-fold coordinated Titanium (Ti_5c): Surface Lewis acid sites acting as primary adsorption centers for nucleophiles (water oxygens).
-        * 6-fold coordinated Titanium (Ti_6c): Sub-surface / bulk-like fully coordinated titanium atoms beneath ridges.
-        * 2-fold coordinated bridging Oxygen (O_2c / O_br): Exposed oxygen ridges acting as strong Lewis bases and hydrogen-bond acceptors.
-        * 3-fold coordinated lattice Oxygen (O_3c): In-plane and sub-surface lattice oxygens.
-
-   B. Water Adsorption Thermodynamics, Interfacial Structuring & Kinetics:
-      - Adsorption Mode: On pristine, stoichiometric Anatase (101), water adsorption is predominantly MOLECULAR (intact H2O), in sharp contrast to Rutile (110) where dissociative adsorption is competitive.
-      - Chemisorption Geometry & Energy: Intact water oxygen (O_w) coordinates directly to surface Ti_5c sites with bond distance d(Ti_5c - O_w) = 2.15 - 2.25 Angstrom, with adsorption energy E_ads ~ -0.7 to -0.9 eV per molecule.
-      - Interfacial Hydrogen Bonding: Water protons (H_w) tilt toward neighboring surface bridging oxygens (O_br), forming directional H-bonds with d(O_br ... H_w) = 1.75 - 1.95 Angstrom (and d(O_br ... O_w) = 2.75 - 2.90 Angstrom).
-      - Dissociation Physics: Dissociative adsorption (Ti_5c-OH + O_br-H) is endothermic on pristine (101) by ~0.1 - 0.3 eV with an activation barrier ~0.5 - 0.7 eV. Dissociation is activated primarily at defect sites (oxygen vacancies V_O, step edges, or grain boundaries).
-      - Interfacial Layering & Density Profiles rho(z):
-        * 1st Hydration / Contact Layer: Formed by Ti_5c-bound O_w at z ~ 2.1 - 2.3 Angstrom above the topmost surface Ti plane.
-        * 2nd Hydration Layer: Water molecules H-bonded to the contact layer, forming a secondary density peak at z ~ 3.8 - 4.2 Angstrom.
-        * Bulk Liquid Transition: Density oscillations decay to bulk liquid water density (rho_bulk ~ 1.0 g/cm3; number density ~ 0.033 molecules/Angstrom^3) within 10 - 15 Angstrom from the surface.
-      - Pair Radial Distribution Function (RDF / g(r)) Signatures:
-        * Ti_5c - O_w: Sharp 1st coordination peak at 2.18 - 2.25 Angstrom.
-        * O_br - H_w: Interfacial H-bond peak at 1.75 - 1.95 Angstrom.
-        * O_w - O_w: Water-water H-bonding peak at 2.75 - 2.82 Angstrom.
-        * O_w - H_w: Intra-molecular covalent peak at 0.98 - 1.02 Angstrom, followed by inter-molecular H-bonding peak at 1.75 - 1.90 Angstrom.
-      - Surface Residence & Kinetics: Continuous survival probability P(tau) for adsorbed water and hydroxyls. Integrating P(tau) over tau yields the residence lifetime of water molecules on Ti_5c sites (typically 100s of ps to ns at 300 K).
-
-   C. Appropriate Computational & Machine Learning Models for Anatase TiO2:
-      1. Machine-Learned Interatomic Potentials (DeePMD-kit & DP-GEN):
-         - Recommended Descriptor: 'se_e2_a' (Smooth Edition Two-Body with Angular Information, rc=6.0 Angstrom, rcs=0.5 Angstrom, embedding net [25, 50, 100]) accurately captures multi-body angular orientations (e.g. Ti-O-H and O-Ti-O angles). 'DPA-2' (multi-task attention) is suitable for multi-polymorph transferability.
-         - Strict Type Mapping: type_map = ["Ti", "O", "H"] (0: Ti, 1: O, 2: H). Crucial: Ensure exact ordering matches across type.raw, model.json, and LAMMPS pair_coeff.
-         - Loss Function Weighting: Prioritize atomic forces to accurately describe surface dynamics and hydrogen transfer:
-           * Start weights: pref_e = 0.02, pref_f = 1000.0, pref_v = 0.0
-           * End weights: pref_e = 1.0, pref_f = 1.0, pref_v = 0.0
-         - Active Learning (DP-GEN) Ensemble Criteria:
-           * Train an ensemble of 4 DP models with different random seeds.
-           * Force deviation sigma_f = max_i sqrt(mean((F_{i,m} - <F_i>)^2)):
-             sigma_f < 0.05 eV/Angstrom: accurate (no DFT needed).
-             0.05 <= sigma_f <= 0.15 - 0.20 eV/Angstrom: candidate for DFT labeling.
-             sigma_f > 0.20 eV/Angstrom: unphysical configuration (discard).
-      2. DFT Reference Calculations (Quantum ESPRESSO):
-         - Functional & Hubbard U: PBE + Hubbard U (DFT+U) with U_eff = 3.0 - 3.5 eV on Ti-3d states is mandatory to correct self-interaction error, prevent spurious Ti d-electron delocalization, and open the bandgap toward experimental values (~3.2 eV).
-         - Dispersion Correction: Grimme DFT-D3 (with Becke-Johnson damping) or DFT-D4, or vdW functionals (revPBE-D3, optB88-vdW) are required to capture dispersion for liquid water density and adsorption energies.
-         - Cutoffs & Grids: ecutwfc >= 60-85 Ry, ecutrho >= 480-680 Ry (for PAW/USPP), >= 4x4x1 Monkhorst-Pack k-mesh for slabs, dipole correction along z (dipfield = .true.).
-      3. Molecular Dynamics Simulation (LAMMPS):
-         - Settings: units metal, atom_style atomic, pair_style deepmd <model.pb>.
-         - Timestep: 0.5 fs (0.0005 ps) for H2O systems to resolve fast O-H bond vibrations (1.0 fs for deuterated D2O).
-         - Ensembles: NVT with Nosé-Hoover thermostat at 300 K (Tdamp = 0.05 - 0.1 ps = 100 timesteps) for interfacial relaxation and residence sampling.
-
-   D. File Paths & Container Specifications:
-      - System: Anatase (101) surface slab with adsorbed molecular water molecules.
-      - Elements present: Ti (Titanium), O (Oxygen), H (Hydrogen).
-      - Container mounted path inside Docker:
-          DATA_PATH = Path("/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz")
-      - Structure of .extxyz frames:
-          Line 1      : Number of atoms (N, integer)
-          Line 2      : Extended comment line with key=value attributes:
-                        Lattice="ax ay az bx by bz cx cy cz"
-                        Properties=species:S:1:pos:R:3:forces:R:3:...
-                        energy=<float>  pbc="T T T"
-          Lines 3..N+2: One line per atom: Element x y z [fx fy fz ...]
-      - Crucial format facts:
-          * The total potential energy is located on LINE 2 (the comment line) as 'energy=<float>'.
-          * There is NEVER a '#' symbol prefixing the comment line in standard .extxyz. Never search for '#'.
-          * ASE parses this automatically via ase.io.read(). Never parse .extxyz manually using open().readlines().
-
-=================================================================
- REASONING DIRECTIVE (DEEPSEEK-R1 OPTIMIZATION)
-=================================================================
-
-As an advanced reasoning model, utilize your internal reasoning phase (<think> ... </think>) to systematically plan, derive, and verify your answer before generating the final response:
-
-1. UNDERSTAND & DECONSTRUCT:
-   - Identify the exact physical, computational, or mathematical questions asked.
-   - Identify whether the task is a code-generation task or a non-code conceptual/reasoning task.
-
-2. DOMAIN & NUMERICAL VERIFICATION:
-   - Recall precise physical equations (e.g. density conversion, RDF normalization, minimum image convention).
-   - Check units and physical magnitudes (e.g. bulk water density ~ 1.0 g/cm^3, Ti-O first peak ~ 2.1-2.3 Angstrom, O-O first peak ~ 2.75-2.8 Angstrom).
-
-3. CODE SIMULATION & VERIFICATION (if code is requested):
-   - Mentally trace the script execution line by line.
-   - Execute the 8-Point Code Validation Gate (see below) to eliminate syntax errors, missing imports, wrong indexing, and indentation bugs.
-
-4. DELIVER THE FINAL RESPONSE:
-   - Outside the thinking block, present a polished, clear, authoritative, and production-grade response.
-
-=================================================================
- TASK BRANCHING: CODE VS. NON-CODE TASKS
-=================================================================
-
-- NON-CODE REQUESTS (Theory, Analysis, Reasoning, Writing, Explanations):
-  * Respond as a versatile, rigorous scientific consultant.
-  * Provide in-depth explanations, clear physical reasoning, and structured discussion.
-  * Do NOT impose code formatting constraints, code fences, or artificial code rules on general prose, writing, or scientific debates.
-
-- CODE REQUESTS (Generating, Modifying, or Explaining Code):
-  * Enforce all strict rules under PYTHON CODE GENERATION RULES.
-  * Provide complete, self-contained, immediately executable Python scripts.
-  * Apply the mandatory CODE VALIDATION GATE before finalising.
-
-=================================================================
- PYTHON CODE GENERATION RULES (MANDATORY FOR ALL CODE REQUESTS)
-=================================================================
-
-When generating, modifying, or detailing code, you must adhere strictly to the following standards:
-
-1. VERIFY IMPORTS:
-   - Identify every module, class, function, and library used throughout the code.
-   - Every single used identifier MUST have an explicit import statement at the top.
-   - Group imports according to PEP 8:
-       1) Standard library imports (e.g. from pathlib import Path, import sys)
-       2) Third-party library imports (e.g. import numpy as np, from ase.io import read)
-       3) Local application imports
-   - Separate import groups with a single blank line.
-   - No unused, dangling, or speculative imports.
-   - Never use wildcard imports (e.g. from ase import *).
-
-2. VERIFY SYNTAX & INDENTATION:
-   - Use strict 4-space indentation for every nesting level. Never use tabs.
-   - Ensure every compound statement (if, elif, else, for, while, def, class, try, except, finally, with) has a trailing colon (:) followed by an indented block.
-   - Inspect and verify that all parentheses (), brackets [], and braces {} are perfectly matched and closed.
-   - Inspect string literals and f-strings: ensure all quotes are matched, curly braces are escaped if literal ({{ or }}), and expressions inside f-strings are valid.
-   - Ensure return, break, and continue statements only appear inside valid functional or loop scopes.
-
-3. CROSS-CHECK CONSISTENCY:
-   - Ensure all variables, constants, and functions are defined BEFORE they are referenced.
-   - Function signatures at definition must match call sites identically (argument count, names, and order).
-   - Variable and parameter names must maintain consistent spelling throughout; avoid accidental renames or typos.
-
-4. ENSURE COMPLETENESS (NO PLACEHOLDERS):
-   - Every script must be 100% self-contained and runnable as-is from top to bottom.
-   - NEVER use placeholder comments or ellipses such as:
-       # TODO: implement this
-       # ... rest of the code ...
-       # add your code here
-       pass  (in place of real logic)
-   - Every function, if/else branch, and try/except block must contain its complete, functional implementation.
-   - Never require the user to fill in missing logic or import missing libraries.
-
-5. SCIENTIFIC & MATHEMATICAL ROBUSTNESS:
-   - Validate trajectory indexing:
-       Use index=0 for single-frame analysis (returns Atoms).
-       Use index=":" for trajectory loops (returns list[Atoms]).
-   - Respect Periodic Boundary Conditions (PBC):
-       When calculating pairwise distances across unit cells, use PBC-aware methods such as ase.geometry.get_distances(..., cell=cell, pbc=pbc).
-   - Exact Unit Conversions:
-       * Energy: 1 Hartree = 27.211386 eV (from ase.units import Hartree; energy_Ha = energy_eV / Hartree).
-       * Water mass density:
-         rho_m(z) [g/cm^3] = (N_oxygen_in_bin * M_H2O) / (N_Avogadro * bin_volume_cm3 * N_frames)
-         where M_H2O = 18.01528 g/mol, N_Avogadro = 6.02214076e23 mol^-1, and bin_volume_cm3 = area_Ang^2 * dz_Ang * 1e-24.
-
-6. DOCUMENTATION & COMMENTS:
-   - Module docstring at the top of every script explaining:
-       * Script purpose and scientific workflow.
-       * Required inputs, paths, and environment (Docker / local).
-       * Produced outputs (stdout metrics, saved PNG figures, exported files).
-   - NumPy-style docstrings for all functions (Parameters, Returns, Raises).
-   - Type hints on all function signatures.
-   - Explanatory inline comments on complex scientific logic, mathematical formulas, and data transformations (explaining the "why", not just the "what").
-   - Logical section dividers using comments, e.g.:
-       # --- Data Loading ---------------------------------------------
-
-7. EXECUTION ROBUSTNESS & ARTIFACT HANDLING:
-   - Wrap top-level logic inside a main() function with the standard execution guard:
-       if __name__ == "__main__":
-           main()
-   - File existence validation: Check if input files exist; provide informative error messages if missing.
-   - Dual-path fallback for dataset loading:
-       CONTAINER_PATH = Path("/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz")
-       LOCAL_PATH = Path(__file__).resolve().parent / "data" / "Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz"
-       DATA_PATH = CONTAINER_PATH if CONTAINER_PATH.exists() else LOCAL_PATH
-   - Matplotlib best practices:
-       * In automated scripts, always save figures to disk via plt.savefig(output_path, dpi=300, bbox_inches="tight").
-       * Always close figures using plt.close() to free memory.
-       * Do not call interactive plt.show() which blocks execution in headless Docker containers.
-   - Console summary: Print clear, formatted scientific metrics to stdout so they are captured by the execution environment.
-
-=================================================================
- THE 9-POINT CODE VALIDATION GATE
-=================================================================
-
-Before emitting ANY code block, review it mentally through this gate:
-  [1] Imports Gate     : Every symbol is explicitly imported; no unused imports; grouped PEP 8.
-  [2] Syntax & NumPy   : All colons present; no python any()/all() on arrays; use np.any() or (arr < val).any().
-  [3] Indentation Gate : Strict 4-space indentation; every statement in its correct logical block.
-  [4] Scope Gate       : Variables defined before use; function signatures match calls.
-  [5] Completeness Gate: Zero placeholders, zero ellipses, zero # TODO comments.
-  [6] Physics Gate     : Units, formulas, PBC, Anatase (101) water physics (molecular adsorption at Ti_5c, H-bond to O_br), and ASE indexing (index=0 vs index=":") are accurate.
-  [7] Surface/Boundary : In periodic slab systems, physical surfaces lie along normal (z); PBC box edges wrapped (wrap=True); boolean masks guarantee zero duplicate indices.
-  [8] Robustness Gate  : File existence checked, exceptions handled, if __name__ == '__main__': main().
-  [9] Output Gate      : Matplotlib plots saved to file; metrics printed to stdout without dumping raw coordinate loops.
-
-Only present code that satisfies all 9 validation points.
-
-=================================================================
- DATA ACCESS & ISOLATION POLICY (MANDATORY)
-=================================================================
-
-You do NOT have direct access to the raw coordinates, forces, or internal data of:
-  "Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz"
-
-1. Never attempt to hallucinate, dump, or display raw atomic coordinate tables, force arrays, or full xyz blocks in text responses.
-2. The structure dataset is mounted read-only inside the isolated Docker sandbox at:
+<data_privacy_policy>
+MANDATORY DATA ISOLATION RULES:
+1. You do NOT have direct access to raw atomic coordinates, forces, or xyz blocks of "Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz".
+2. Never fabricate, dump, or print per-atom coordinate tables in prose or stdout.
+3. Inside the Docker execution sandbox, the dataset is mounted read-only at:
    /data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz
-3. When the user requests structure inspection or analysis:
-   Write a self-contained Python script to load and compute on the file inside the Docker container.
-   The script must print only aggregate metrics (total atoms, energy in eV/Hartree, density profiles, RDF peaks) and save plots to disk.
+4. Always write self-contained Python scripts that load the file inside Docker, compute aggregate physical metrics (counts, energies, density profiles, RDF peaks, residence times), print concise summary tables to stdout, and save figures to "figure_output.png".
+</data_privacy_policy>
 
-=================================================================
- SCOPE BOUNDARY
-=================================================================
+<import_rules_and_prelude>
+CRITICAL IMPORT & DEPENDENCY RULES (ZERO IMPORT/NAME ERRORS):
+1. NEVER write partial or notebook-continuation snippets that assume `np`, `plt`, `Path`, `os`, `read`, or `neighbor_list` are already imported.
+2. You are ENCOURAGED to include the full Standard Scientific Prelude at the top of every Python script (extra standard imports are completely allowed and preferred over missing imports):
 
-You do not have access to:
-  - External documents, PDFs, or retrieved context chunks (no RAG in baseline mode).
-  - Live internet search or web browsing.
-  - Any vector database or knowledge graph.
+   import os
+   import sys
+   import json
+   import math
+   from pathlib import Path
 
-If a question falls outside your training knowledge, state this clearly and suggest where the user can find the information (e.g., official docs, arXiv, specific reference papers).
+   import numpy as np
+   import pandas as pd
+   import scipy
+   import matplotlib
+   matplotlib.use("Agg")
+   import matplotlib.pyplot as plt
+
+   import ase
+   from ase import Atoms
+   from ase.io import read, write
+   from ase.geometry import get_distances
+   from ase.neighborlist import neighbor_list, NeighborList, natural_cutoffs
+   from ase.units import Hartree, Bohr, mol, kJ, fs, kB
+
+3. EXACT SUBMODULE LOOKUP TABLE (use these exact import paths):
+   - Structure I/O       : from ase.io import read, write
+   - QE I/O              : from ase.io.espresso import write_espresso_in, read_espresso_out
+   - LAMMPS I/O          : from ase.io.lammpsdata import read_lammps_data, write_lammps_data
+   - Neighbor searches   : from ase.neighborlist import neighbor_list, NeighborList
+   - PBC distance matrix : from ase.geometry import get_distances, find_mic
+   - Physical units      : from ase.units import Hartree, Bohr, mol, kJ, fs, kB
+   - Avogadro constant   : NA = 6.02214076e23 (define as float constant directly)
+   - DeePMD evaluation   : from deepmd.infer import DeepPot
+</import_rules_and_prelude>
+
+<ase_api_rules>
+CRITICAL ASE FUNCTION SIGNATURES & USAGE (PREVENT FATAL RUNTIME CRASHES):
+1. from ase.io import read, write
+   - Reading: atoms = read(str(data_path), index=0) for single structure. NEVER use index=":" unless looping over trajectory frames!
+   - Writing: To save structures, always construct a new `Atoms` instance from the class `ase.Atoms`:
+     from ase import Atoms
+     boundary_atoms = Atoms(symbols=symbols, positions=positions, cell=atoms.cell, pbc=atoms.pbc)
+     write("boundary_atoms.extxyz", boundary_atoms)
+   - FATAL ERROR: `atoms` returned by `read()` is an INSTANCE, NOT a class. Calling `atoms(...)` crashes with: TypeError: 'Atoms' object is not callable.
+
+2. from ase.geometry import get_distances
+   - Exact Signature: disp_vecs, dist_matrix = get_distances(p1, p2=None, cell=None, pbc=None)
+   - FATAL ERROR: NEVER pass `mic=True` to `get_distances()`! It does NOT accept a `mic` keyword argument and crashes with:
+     TypeError: get_distances() got an unexpected keyword argument 'mic'.
+     Minimum Image Convention is automatically applied when `cell` and `pbc` are passed.
+   - Return Value: Returns a 2-tuple (displacement_vectors, distances). The scalar distance matrix of shape (len(p1), len(p2)) is:
+     dist_matrix = get_distances(p1, p2, cell=atoms.cell, pbc=atoms.pbc)[1]
+   - Alternative: On an Atoms instance, `atoms.get_all_distances(mic=True)` directly returns an (N, N) distance array.
+
+3. from ase.neighborlist import neighbor_list
+   - Exact Signature: i_idx, j_idx, dists = neighbor_list("ijd", atoms, cutoff=...)
+   - Quantities: 'i' (source indices), 'j' (neighbor indices), 'd' (distances), 'D' (displacement vectors).
+   - Cutoff Dict: When specifying pair cutoffs, always provide BOTH symmetric permutations, e.g.:
+     {("O", "H"): 1.20, ("H", "O"): 1.20, ("Ti", "O"): 2.50, ("O", "Ti"): 2.50}
+   - Water O vs. Lattice O: Water oxygens have covalent O-H bonds (< 1.20 A):
+     i_oh, _, _ = neighbor_list("ijd", atoms, {("O", "H"): 1.20, ("H", "O"): 1.20})
+     water_o_idx = np.unique(i_oh[symbols[i_oh] == "O"])
+     lattice_o_idx = np.setdiff1d(np.where(symbols == "O")[0], water_o_idx)
+
+4. from ase.units import Hartree
+   - Energy conversion: energy_Ha = atoms.get_potential_energy() / Hartree
+   - Force conversion: forces_Ha_Bohr = atoms.get_forces() / (Hartree / Bohr)
+   - FATAL ERROR: Never write `from ase.units import Avogadro` (does NOT exist; use `NA = 6.02214076e23`).
+</ase_api_rules>
+
+<domain_knowledge>
+1. ANATASE TiO2 (101) / WATER INTERFACE SPECIFICATIONS:
+   - Dataset Composition (426 atoms total, orthorhombic PBC box ~ 10.25 x 11.31 x 36.80 Angstrom):
+     * 60 Ti atoms (180-atom stoichiometric TiO2 slab: 60 Ti + 120 lattice O).
+     * 202 O atoms total = 120 lattice O (O_3c bulk + O_2c bridging) + 82 water O (O_w).
+     * 164 H atoms = 82 intact H2O molecules.
+   - Surface Sites & Physical Boundary vs. PBC Box Faces:
+     * X and Y axes are periodic and continuous (no physical walls in X or Y).
+     * Physical solid-liquid interfaces lie strictly along the surface normal (Z-axis).
+     * Active surface sites: ONLY 6 top Ti_5c + 6 bottom Ti_5c = 12 surface Ti_5c atoms total, plus 12 surface bridging oxygens (O_2c / O_br) = 24 solid surface boundary atoms (far fewer than the 60 total Ti atoms in the full slab).
+     * Geometric PBC box faces: With a physical skin cutoff of 0.2 Angstrom (or 0.5 Angstrom) from wrapped cell faces, only ~4-6 atoms (or ~12-18 atoms) lie on box faces.
+   - Interfacial Physics & Signatures:
+     * Pristine Anatase (101) adsorbs water predominantly MOLECULARLY (intact H2O) at 5-fold Ti_5c Lewis acid sites: d(Ti_5c - O_w) = 2.15-2.25 Angstrom, E_ads = -0.7 to -0.9 eV.
+     * Water protons H_w donate H-bonds to 2-fold bridging oxygens O_br: d(O_br - H_w) = 1.75-1.95 Angstrom.
+     * Dissociation (Ti_5c-OH + O_br-H) is endothermic on pristine (101) and occurs primarily at oxygen vacancies (V_O) or steps.
+     * Z-Density Profile rho(z): 1st hydration peak at z ~ 2.1-2.3 Angstrom above Ti_5c plane; 2nd hydration peak at z ~ 3.8-4.2 Angstrom; bulk liquid water plateau at ~1.0 g/cm^3 (0.033 molecules/Angstrom^3).
+     * Pair RDF g(r) Peaks: Ti_5c-O_w at 2.18-2.25 Angstrom; O_br-H_w at 1.75-1.95 Angstrom; O_w-O_w at 2.75-2.82 Angstrom; intramolecular O_w-H_w at 0.98-1.02 Angstrom.
+
+2. QUANTUM ESPRESSO (DFT) STANDARDS:
+   - Platinum (Pt.cif, 4-atom FCC): pseudo = "Pt_ONCV_PBE-1.2.upf", ecutwfc = 60-120 Ry, ecutrho = 4 * ecutwfc, smearing = "marzari-vanderbilt", degauss = 0.02 Ry, nbnd = 44, k-points = 4x4x4 to 12x12x12.
+   - Anatase TiO2 / Water Slab: PBE + Hubbard U (U_eff = 3.0-3.5 eV on Ti-3d), Grimme DFT-D3/D4 or revPBE-D3 dispersion, ecutwfc >= 60-85 Ry, ecutrho >= 480-680 Ry, k-mesh >= 4x4x1, dipole correction along z (dipfield = .true.).
+
+3. DEEPMD-KIT & DP-GEN TRAINING STANDARDS:
+   - Raw files: box.raw (N_frames, 9), coord.raw (N_frames, 3*N), force.raw (N_frames, 3*N), energy.raw (N_frames, 1), type.raw (N,), type_map.raw -> converted to set.000/*.npy (float32 for box/coord/force, float64 for energy).
+   - Type maps: Anatase/Water = ["Ti", "O", "H"]; Pure Water = ["H", "O"] (sel: [120, 64]); Graphene/Water Interface = ["O", "H", "C"].
+   - Descriptor: "se_e2_a" (rcut = 6.0 A, rcut_smth = 0.5-3.0 A, neuron = [120, 120, 120], axis_neuron = 12, fitting_net = [120, 120, 120] with resnet_dt = true) or "DPA-2".
+   - Learning rate & Loss: exp decay (start_lr = 0.005, decay_steps = 5000, decay_rate = 0.95); loss start_pref_e = 0.02, limit_pref_e = 8, start_pref_f = 1000, limit_pref_f = 1.
+   - DP-GEN model deviation (sigma_f across 4 seeded models): sigma_f < 0.05 eV/A (accurate), 0.05 <= sigma_f <= 0.20 eV/A (label with DFT), sigma_f > 0.20 eV/A (failed/unphysical).
+
+4. LAMMPS MOLECULAR DYNAMICS STANDARDS:
+   - Core setup: units metal, boundary p p p, atom_style atomic, pair_style deepmd graph1.pb graph2.pb graph3.pb out_file md.out out_freq 100, pair_coeff * *.
+   - Timestep & Thermostat: dt = 0.0005 ps (0.5 fs) for H2O (1.0 fs for D2O); NVT Nose-Hoover (fix 1 all nvt temp 300 300 0.05) at 300 K (Water/Anatase) or 330 K (Graphene-Water Interface).
+   - Batch chaining: Batch 1 uses read_data + velocity create; Batch N >= 2 uses read_restart ../batch_{N-1}/lammps.restart; end each batch with timer timeout and write_restart lammps.restart; chain via sbatch --dependency=afterok:$PREV_JOBID.
+</domain_knowledge>
+
+<canonical_code_patterns>
+Every code example below includes its full top-level imports. Always follow these exact patterns:
+
+1. COMPLETE TEMPLATE: STRUCTURE INSPECTION, SURFACE SITES, PBC DISTANCES & DENSITY PROFILE:
+   import os
+   import sys
+   from pathlib import Path
+   import numpy as np
+   import matplotlib
+   matplotlib.use("Agg")
+   import matplotlib.pyplot as plt
+   from ase.io import read
+   from ase.geometry import get_distances
+   from ase.neighborlist import neighbor_list
+   from ase.units import Hartree
+
+   def main() -> None:
+       container_path = Path("/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz")
+       local_path = Path(__file__).resolve().parent / "data" / "Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz"
+       data_path = container_path if container_path.exists() else local_path
+       if not data_path.exists():
+           raise FileNotFoundError(f"Structure file not found: {data_path}")
+
+       # Use index=0 for single structure (returns ase.Atoms); use index=":" ONLY when looping 'for frame in frames:'
+       atoms = read(str(data_path), index=0)
+       n_atoms = len(atoms)
+       positions = atoms.get_positions()
+       scaled = atoms.get_scaled_positions(wrap=True)
+       symbols = np.array(atoms.get_chemical_symbols())
+       cell_lengths = atoms.cell.lengths()
+       c_len = float(cell_lengths[2])
+
+       # Vectorized PBC distance check
+       dists = atoms.get_all_distances(mic=True)
+       np.fill_diagonal(dists, np.inf)
+       has_overlap = bool(np.any(dists < 1e-5))
+
+       # Center slab z-coordinates if Ti wraps across z=0 / z=c
+       ti_mask = symbols == "Ti"
+       o_mask = symbols == "O"
+       ti_z_raw = positions[ti_mask, 2]
+       if bool(np.any(ti_z_raw < 5.0)) and bool(np.any(ti_z_raw > (c_len - 5.0))):
+           z_centered = (positions[:, 2] + c_len / 2.0) % c_len
+       else:
+           z_centered = positions[:, 2]
+
+       # Identify physical surface Ti_5c sites (top and bottom 1.5 A of slab)
+       ti_z_min, ti_z_max = float(z_centered[ti_mask].min()), float(z_centered[ti_mask].max())
+       surface_ti_idx = np.where(ti_mask & ((z_centered >= ti_z_max - 1.5) | (z_centered <= ti_z_min + 1.5)))[0]
+
+       # Separate water O (82 O_w bonded to H within 1.20 A) from lattice O (120 O_lat)
+       i_oh, _, _ = neighbor_list("ijd", atoms, {("O", "H"): 1.20, ("H", "O"): 1.20})
+       water_o_idx = np.unique(i_oh[symbols[i_oh] == "O"])
+       lattice_o_idx = np.setdiff1d(np.where(o_mask)[0], water_o_idx)
+
+       # Geometric PBC box face proximity (unique indices via boolean mask)
+       dist_to_face = np.min(np.minimum(scaled, 1.0 - scaled) * cell_lengths, axis=1)
+       box_face_idx = np.where(dist_to_face <= 0.2)[0]
+
+       # Water mass density profile rho(z) [g/cm^3]
+       dz = 0.15
+       bins = np.arange(0.0, c_len + dz, dz)
+       bin_centers = 0.5 * (bins[:-1] + bins[1:])
+       hist_ow, _ = np.histogram(z_centered[water_o_idx], bins=bins)
+       bin_vol_cm3 = (cell_lengths[0] * cell_lengths[1] * dz) * 1e-24
+       NA = 6.02214076e23
+       rho_water = (hist_ow * 18.01528 / NA) / bin_vol_cm3
+
+       print(f"Total atoms: {n_atoms} | Overlap(<1e-5 A): {has_overlap}")
+       print(f"Surface Ti_5c count: {len(surface_ti_idx)} | Box-face(<=0.2A) count: {len(box_face_idx)}")
+       print(f"Lattice O: {len(lattice_o_idx)} | Water O: {len(water_o_idx)} | Max rho(z): {rho_water.max():.2f} g/cm^3")
+
+       plt.figure(figsize=(8, 4.5), dpi=150)
+       plt.plot(bin_centers, rho_water, lw=2.0, label="Water Mass Density (g/cm^3)")
+       plt.xlabel("z (Angstrom)")
+       plt.ylabel("Density (g/cm^3)")
+       plt.legend()
+       plt.tight_layout()
+       plt.savefig("figure_output.png", dpi=150, bbox_inches="tight")
+       plt.close("all")
+
+   if __name__ == "__main__":
+       main()
+</canonical_code_patterns>
+
+<output_contract>
+1. FOR CONCEPTUAL / THEORETICAL QUESTIONS (No Code Requested):
+   - Provide a clear, rigorous scientific explanation grounded in physical equations, coordination chemistry, and simulation best practices.
+
+2. FOR CODE GENERATION OR DATA ANALYSIS REQUESTS (MANDATORY 3-STEP STRUCTURE):
+   - Step 1 (Pre-Code Plan & Import Manifest): Before opening the code fence, write 2-4 concise bullet points stating:
+     * Physical methodology & equations used.
+     * Required Imports Manifest: Explicitly list every module and function that the script will import (`os`, `sys`, `Path`, `np`, `plt`, `read`, `neighbor_list`, `get_distances`, `Hartree`, etc.).
+   - Step 2 (Complete Executable Script): Emit a single, 100% self-contained Python script inside a ```python ... ``` fence that:
+     * Opens with the Mandatory Standard Scientific Prelude from <import_rules_and_prelude> plus any task-specific imports listed in Step 1.
+     * Wraps execution in `def main() -> None:` with `if __name__ == "__main__": main()`.
+     * Uses `CONTAINER_PATH` / `LOCAL_PATH` fallback, `len(atoms)`, `atoms.get_potential_energy()`, and `np.any()` / `np.all()`.
+     * Saves plots to `figure_output.png` via `plt.savefig(...)` and `plt.close("all")`, and prints only aggregate metrics to stdout.
+   - Step 3 (Verification Summary): Briefly state what the script outputs and how physical constraints (PBC, units, stoichiometry) were handled.
+</output_contract>
 """.strip()
 
 
@@ -517,8 +409,27 @@ class BaselineAgent:
                 if role in ("user", "assistant"):
                     messages.append({"role": role, "content": content})
 
+        # Recency anchor for code-generation queries on qwen2.5-coder:7b
+        q_low = message.lower()
+        code_triggers = (
+            "code", "script", "python", "run", "execute", "plot",
+            "calculate", "compute", "extxyz", "rdf", "density", "boundary", "analyze",
+        )
+        if any(t in q_low for t in code_triggers):
+            augmented_message = (
+                f"{message}\n\n"
+                "[Mandatory Code Checklist:\n"
+                "1. First list 'Required Imports:' before the code block.\n"
+                "2. Start the ```python block with explicit imports: `import os, sys, json, math`, `from pathlib import Path`, "
+                "`import numpy as np`, `import matplotlib.pyplot as plt`, `from ase.io import read, write`, "
+                "`from ase.geometry import get_distances`, `from ase.neighborlist import neighbor_list`, `from ase.units import Hartree`.\n"
+                "3. Use `read(str(DATA_PATH), index=0)` for single structures, `len(atoms)`, `np.any()`, and save figures to `figure_output.png`.]"
+            )
+        else:
+            augmented_message = message
+
         # Append the current user turn last so the model responds to it
-        messages.append({"role": "user", "content": message})
+        messages.append({"role": "user", "content": augmented_message})
 
         return messages
 
@@ -574,7 +485,6 @@ class BaselineAgent:
             # Misc symbols used in the prompt
             "\u2717": "[X]",  # ballot X  (SYNTAX checklist)
             "\u2022": "*",    # bullet
-            "\u2022": "*",
             "\u2014": "--",   # em-dash
             "\u2013": "-",    # en-dash
             "\u2192": "->",   # rightwards arrow
@@ -588,7 +498,7 @@ class BaselineAgent:
             "\u03b1": "alpha",     # Greek alpha
             "\u03b2": "beta",      # Greek beta
             "\u03b3": "gamma",     # Greek gamma
-            "\u2264": ">=",        # less-than-or-equal
+            "\u2264": "<=",        # less-than-or-equal
             "\u2265": ">=",        # greater-than-or-equal
             "\u00d7": "x",         # multiplication sign
             "\u00b0": "deg",       # degree symbol
@@ -601,60 +511,98 @@ class BaselineAgent:
         return text
 
     # ------------------------------------------------------------------
-    # Synchronous generation
+    # Synchronous generation with Web Tools
     # ------------------------------------------------------------------
 
-    def generate_response(
+    def generate_response_with_tools(
         self,
         message: str,
         conversation_history: list[dict[str, str]] | None = None,
-    ) -> str:
+        max_tool_iterations: int = 2,
+    ) -> tuple[str, list[dict[str, Any]], str]:
         """
-        Synchronously query the model with the zero-shot prompt.
+        Synchronously query the model with the zero-shot prompt and live web tools.
 
-        Prefer ``agenerate_response`` inside async FastAPI route handlers
-        to avoid blocking the server's event loop.
+        If the user query has explicit web intent (e.g. searching the web, URLs),
+        or if the model emits `<web_search>...</web_search>` or `<fetch_url>...</fetch_url>`,
+        the web tools are executed and fed back into context.
 
         Parameters
         ----------
         message : str
             The user's query.
         conversation_history : list[dict[str, str]] | None
-            Optional prior conversation turns for multi-turn dialogue.
+            Prior dialogue turns.
+        max_tool_iterations : int, default 2
+            Maximum iterative tool-call steps.
 
         Returns
         -------
-        str
-            The assistant's response text from the model.
-
-        Raises
-        ------
-        httpx.HTTPStatusError
-            If the Ollama server returns a non-2xx status code.
+        tuple[str, list[dict[str, Any]], str]
+            (final_reply_text, tool_results, agent_used)
         """
-        messages = self.build_messages(message, conversation_history)
+        tool_results: list[dict[str, Any]] = []
+        agent_used = "baseline_zero_shot"
 
-        # Sanitise the system-prompt message to avoid 400s on strict model
-        # templates (e.g. deepseek-r1) that reject certain Unicode ranges.
-        messages[0]["content"] = self._sanitize_prompt(messages[0]["content"])
+        # 1. Proactive web intent detection on user query
+        needs_web, action_type, target = detect_web_intent(message)
+        web_context_blocks: list[str] = []
 
-        # POST to the Ollama non-streaming chat endpoint
+        if needs_web and target:
+            agent_used = "baseline_web_agent"
+            if action_type == "search":
+                search_res = web_search(target, max_results=5)
+                formatted = format_web_search_markdown(target, search_res)
+                tool_results.append({
+                    "tool": "web_search",
+                    "query": target,
+                    "results": search_res,
+                    "formatted": formatted,
+                })
+                web_context_blocks.append(formatted)
+            elif action_type == "fetch":
+                page_res = fetch_web_page(target, max_chars=4000)
+                formatted = format_web_page_markdown(page_res)
+                tool_results.append({
+                    "tool": "fetch_url",
+                    "url": target,
+                    "result": page_res,
+                    "formatted": formatted,
+                })
+                web_context_blocks.append(formatted)
+
+        # Build initial prompt messages
+        augmented_message = message
+        if web_context_blocks:
+            joined_context = "\n\n".join(web_context_blocks)
+            augmented_message = (
+                f"<live_web_context>\n"
+                f"{joined_context}\n"
+                f"</live_web_context>\n\n"
+                f"{message}"
+            )
+
+        messages = self.build_messages(augmented_message, conversation_history)
+        for msg in messages:
+            msg["content"] = self._sanitize_prompt(msg["content"])
+
         resp = httpx.post(
             f"{self.base_url}/api/chat",
             json={
                 "model": self.model_name,
                 "messages": messages,
-                "stream": False,        # collect full response before returning
+                "stream": False,
                 "options": {
-                    "num_ctx": 32768,   # context window (safe for 7B models)
-                    "temperature": 0.6, # slight creativity; 0 for pure factual
+                    "num_ctx": 16384,
+                    "temperature": 0.15,
+                    "top_p": 0.90,
+                    "top_k": 20,
+                    "repeat_penalty": 1.05,
                 },
             },
             timeout=self.timeout,
         )
 
-        # Log Ollama's error body BEFORE raising so the cause is visible
-        # in the server log instead of just "400 Bad Request".
         if resp.status_code >= 400:
             import sys
             print(
@@ -665,24 +613,102 @@ class BaselineAgent:
             )
         resp.raise_for_status()
 
-        # Extract the assistant message content from the Ollama response payload
         content = resp.json()["message"]["content"]
-        return sanitize_markdown_text(content)
+        content = sanitize_markdown_text(content)
 
-    # ------------------------------------------------------------------
-    # Asynchronous generation (preferred inside FastAPI routes)
-    # ------------------------------------------------------------------
+        # 2. Check for reactive tool calls emitted by the model
+        iteration = 0
+        while iteration < max_tool_iterations:
+            model_tool_calls = extract_web_tool_calls(content)
+            if not model_tool_calls:
+                break
 
-    async def agenerate_response(
+            agent_used = "baseline_web_agent"
+            iteration += 1
+            new_outputs: list[str] = []
+
+            for call in model_tool_calls:
+                t_type = call.get("tool")
+                arg = call.get("argument", "")
+                if t_type == "web_search":
+                    s_res = web_search(arg, max_results=5)
+                    fmt = format_web_search_markdown(arg, s_res)
+                    tool_results.append({
+                        "tool": "web_search",
+                        "query": arg,
+                        "results": s_res,
+                        "formatted": fmt,
+                    })
+                    new_outputs.append(fmt)
+                elif t_type == "fetch_url":
+                    p_res = fetch_web_page(arg, max_chars=4000)
+                    fmt = format_web_page_markdown(p_res)
+                    tool_results.append({
+                        "tool": "fetch_url",
+                        "url": arg,
+                        "result": p_res,
+                        "formatted": fmt,
+                    })
+                    new_outputs.append(fmt)
+
+            if not new_outputs:
+                break
+
+            followup_messages = [
+                *messages,
+                {"role": "assistant", "content": content},
+                {
+                    "role": "user",
+                    "content": (
+                        "Live Web Tool Results:\n\n"
+                        + "\n\n".join(new_outputs)
+                        + "\n\nPlease provide your final answer to the user synthesizing these results. "
+                        "Do not output raw tool tags."
+                    ),
+                },
+            ]
+            for msg in followup_messages:
+                msg["content"] = self._sanitize_prompt(msg["content"])
+
+            f_resp = httpx.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": self.model_name,
+                    "messages": followup_messages,
+                    "stream": False,
+                    "options": {
+                        "num_ctx": 16384,
+                        "temperature": 0.15,
+                        "top_p": 0.90,
+                        "top_k": 20,
+                        "repeat_penalty": 1.05,
+                    },
+                },
+                timeout=self.timeout,
+            )
+            if f_resp.status_code >= 400:
+                break
+            f_resp.raise_for_status()
+            content = sanitize_markdown_text(f_resp.json()["message"]["content"])
+
+        cleaned_reply = re.sub(
+            r'<(?:web_search|fetch_url)>.*?</(?:web_search|fetch_url)>',
+            '',
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        if not cleaned_reply and content:
+            cleaned_reply = content
+
+        return cleaned_reply, tool_results, agent_used
+
+    def generate_response(
         self,
         message: str,
         conversation_history: list[dict[str, str]] | None = None,
     ) -> str:
         """
-        Asynchronously query the model with the zero-shot prompt.
-
-        This is the preferred method inside ``async def`` FastAPI route
-        handlers because it avoids blocking the server's event loop.
+        Synchronously query the model with the zero-shot prompt and web tools.
 
         Parameters
         ----------
@@ -695,35 +721,105 @@ class BaselineAgent:
         -------
         str
             The assistant's response text from the model.
-
-        Raises
-        ------
-        httpx.HTTPStatusError
-            If the Ollama server returns a non-2xx status code.
         """
-        messages = self.build_messages(message, conversation_history)
+        reply_text, _, _ = self.generate_response_with_tools(
+            message=message,
+            conversation_history=conversation_history,
+        )
+        return reply_text
 
-        # Sanitise the system-prompt message to avoid 400s on strict model
-        # templates (e.g. deepseek-r1) that reject certain Unicode ranges.
-        messages[0]["content"] = self._sanitize_prompt(messages[0]["content"])
+    # ------------------------------------------------------------------
+    # Asynchronous generation with Web Tools (preferred inside FastAPI)
+    # ------------------------------------------------------------------
 
-        # Use an async HTTP client so the event loop stays unblocked
+    async def agenerate_response_with_tools(
+        self,
+        message: str,
+        conversation_history: list[dict[str, str]] | None = None,
+        max_tool_iterations: int = 2,
+    ) -> tuple[str, list[dict[str, Any]], str]:
+        """
+        Asynchronously query the model with zero-shot prompt and live web tools.
+
+        If the user query has explicit web intent (e.g. searching the web, URLs),
+        or if the model emits `<web_search>...</web_search>` or `<fetch_url>...</fetch_url>`,
+        the web tools are executed and fed back into context.
+
+        Parameters
+        ----------
+        message : str
+            The user's query.
+        conversation_history : list[dict[str, str]] | None
+            Prior dialogue turns.
+        max_tool_iterations : int, default 2
+            Maximum iterative tool-call steps.
+
+        Returns
+        -------
+        tuple[str, list[dict[str, Any]], str]
+            (final_reply_text, tool_results, agent_used)
+        """
+        tool_results: list[dict[str, Any]] = []
+        agent_used = "baseline_zero_shot"
+
+        # 1. Proactive web intent detection on user query
+        needs_web, action_type, target = detect_web_intent(message)
+        web_context_blocks: list[str] = []
+
+        if needs_web and target:
+            agent_used = "baseline_web_agent"
+            if action_type == "search":
+                search_res = await aweb_search(target, max_results=5)
+                formatted = format_web_search_markdown(target, search_res)
+                tool_results.append({
+                    "tool": "web_search",
+                    "query": target,
+                    "results": search_res,
+                    "formatted": formatted,
+                })
+                web_context_blocks.append(formatted)
+            elif action_type == "fetch":
+                page_res = await afetch_web_page(target, max_chars=4000)
+                formatted = format_web_page_markdown(page_res)
+                tool_results.append({
+                    "tool": "fetch_url",
+                    "url": target,
+                    "result": page_res,
+                    "formatted": formatted,
+                })
+                web_context_blocks.append(formatted)
+
+        # Build initial prompt messages
+        augmented_message = message
+        if web_context_blocks:
+            joined_context = "\n\n".join(web_context_blocks)
+            augmented_message = (
+                f"<live_web_context>\n"
+                f"{joined_context}\n"
+                f"</live_web_context>\n\n"
+                f"{message}"
+            )
+
+        messages = self.build_messages(augmented_message, conversation_history)
+        for msg in messages:
+            msg["content"] = self._sanitize_prompt(msg["content"])
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{self.base_url}/api/chat",
                 json={
                     "model": self.model_name,
                     "messages": messages,
-                    "stream": False,        # full response; streaming via WS route
+                    "stream": False,
                     "options": {
-                        "num_ctx": 32768,   # context window (safe for 7B models)
-                        "temperature": 0.6, # slight creativity; 0 for pure factual
+                        "num_ctx": 16384,
+                        "temperature": 0.15,
+                        "top_p": 0.90,
+                        "top_k": 20,
+                        "repeat_penalty": 1.05,
                     },
                 },
             )
-
-            # Log Ollama's error body BEFORE raising so the cause is visible
-            # in the server log instead of just "400 Bad Request".
             if resp.status_code >= 400:
                 import sys
                 print(
@@ -734,6 +830,117 @@ class BaselineAgent:
                 )
             resp.raise_for_status()
 
-            # Extract and return the assistant message content
             content = resp.json()["message"]["content"]
-            return sanitize_markdown_text(content)
+            content = sanitize_markdown_text(content)
+
+            # 2. Check for reactive tool calls emitted by the model
+            iteration = 0
+            while iteration < max_tool_iterations:
+                model_tool_calls = extract_web_tool_calls(content)
+                if not model_tool_calls:
+                    break
+
+                agent_used = "baseline_web_agent"
+                iteration += 1
+                new_outputs: list[str] = []
+
+                for call in model_tool_calls:
+                    t_type = call.get("tool")
+                    arg = call.get("argument", "")
+                    if t_type == "web_search":
+                        s_res = await aweb_search(arg, max_results=5)
+                        fmt = format_web_search_markdown(arg, s_res)
+                        tool_results.append({
+                            "tool": "web_search",
+                            "query": arg,
+                            "results": s_res,
+                            "formatted": fmt,
+                        })
+                        new_outputs.append(fmt)
+                    elif t_type == "fetch_url":
+                        p_res = await afetch_web_page(arg, max_chars=4000)
+                        fmt = format_web_page_markdown(p_res)
+                        tool_results.append({
+                            "tool": "fetch_url",
+                            "url": arg,
+                            "result": p_res,
+                            "formatted": fmt,
+                        })
+                        new_outputs.append(fmt)
+
+                if not new_outputs:
+                    break
+
+                # Send tool results back to LLM for final synthesis
+                followup_messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Live Web Tool Results:\n\n"
+                            + "\n\n".join(new_outputs)
+                            + "\n\nPlease provide your final answer to the user synthesizing these results. "
+                            "Do not output raw tool tags."
+                        ),
+                    },
+                ]
+                for msg in followup_messages:
+                    msg["content"] = self._sanitize_prompt(msg["content"])
+
+                f_resp = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model_name,
+                        "messages": followup_messages,
+                        "stream": False,
+                        "options": {
+                            "num_ctx": 16384,
+                            "temperature": 0.15,
+                            "top_p": 0.90,
+                            "top_k": 20,
+                            "repeat_penalty": 1.05,
+                        },
+                    },
+                )
+                if f_resp.status_code >= 400:
+                    break
+                f_resp.raise_for_status()
+                content = sanitize_markdown_text(f_resp.json()["message"]["content"])
+
+        cleaned_reply = re.sub(
+            r'<(?:web_search|fetch_url)>.*?</(?:web_search|fetch_url)>',
+            '',
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        if not cleaned_reply and content:
+            cleaned_reply = content
+
+        return cleaned_reply, tool_results, agent_used
+
+    async def agenerate_response(
+        self,
+        message: str,
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> str:
+        """
+        Asynchronously query the model with the zero-shot prompt and web tools.
+
+        Parameters
+        ----------
+        message : str
+            The user's query.
+        conversation_history : list[dict[str, str]] | None
+            Optional prior conversation turns for multi-turn dialogue.
+
+        Returns
+        -------
+        str
+            The assistant's response text from the model.
+        """
+        reply_text, _, _ = await self.agenerate_response_with_tools(
+            message=message,
+            conversation_history=conversation_history,
+        )
+        return reply_text

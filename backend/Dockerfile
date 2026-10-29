@@ -4,7 +4,9 @@ FROM python:3.10-slim
 # Prevent Python from writing .pyc files and enable unbuffered output
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    CHATBOX_OLLAMA_BASE_URL=http://host.docker.internal:11434 \
+    CHATBOX_WORKSPACE_ROOT=/app
 
 WORKDIR /app
 

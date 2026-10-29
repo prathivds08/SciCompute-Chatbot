@@ -31,14 +31,17 @@ def save_analysis_script(
     session_id: str,
     description: str = "DeePMD scientific analysis script",
 ) -> dict[str, Any]:
-    """Save a generated Python analysis script to disk and register it in SQLite artifacts."""
-    scripts_dir = settings.SCRIPTS_DIR / session_id
+    safe_sid = Path(session_id or "default").name
+    safe_name = Path(script_name).name
+    if not safe_name.endswith(".py"):
+        safe_name += ".py"
+
+    scripts_dir = (settings.SCRIPTS_DIR / safe_sid).resolve()
+    if not scripts_dir.is_relative_to(settings.SCRIPTS_DIR.resolve()):
+        raise ValueError("Invalid session_id path.")
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
-    if not script_name.endswith(".py"):
-        script_name += ".py"
-
-    target_path = scripts_dir / script_name
+    target_path = scripts_dir / safe_name
     target_path.write_text(code, encoding="utf-8")
     size_bytes = target_path.stat().st_size
 
@@ -90,7 +93,7 @@ if not extxyz_path.exists():
     raise FileNotFoundError(f"Input structure file not found: {{extxyz_path}}")
 
 print(f"Loading structure from {{extxyz_path}} ...")
-atoms = read(str(extxyz_path))
+atoms = read(str(extxyz_path), index=0)
 cell = atoms.get_cell()
 lengths = cell.lengths()
 A_xy = lengths[0] * lengths[1]
@@ -107,11 +110,11 @@ h_idx = np.where(symbols == "H")[0]
 print(f"Total atoms in cell: {{len(atoms)}} (Box: {{lengths[0]:.2f}} x {{lengths[1]:.2f}} x {{lengths[2]:.2f}} A)")
 print(f"Species counts: Ti={{len(ti_idx)}}, O={{len(o_idx)}}, H={{len(h_idx)}}")
 
-# Identify bulk TiO2 lattice oxygen vs interfacial/water oxygen
-# TiO2 stoichiometry: each Ti pairs with 2 lattice oxygens -> 60 Ti => 120 lattice O
-sorted_o_idx = o_idx[np.argsort(z_coords[o_idx])]
-lattice_o_idx = sorted_o_idx[:120]
-water_o_idx = sorted_o_idx[120:]
+# Identify bulk TiO2 lattice oxygen vs interfacial/water oxygen via PBC-aware Ti-O coordination
+from ase.neighborlist import neighbor_list
+_, j_o, _ = neighbor_list('ijd', atoms, {{('Ti', 'O'): 2.40}})
+lattice_o_idx = np.unique(j_o)
+water_o_idx = np.setdiff1d(o_idx, lattice_o_idx)
 
 print(f"Classified {{len(lattice_o_idx)}} lattice oxygen atoms and {{len(water_o_idx)}} water oxygen atoms ({{len(h_idx)}} H).")
 
@@ -187,7 +190,7 @@ data_dir = Path("/data") if os.path.exists("/data") else Path(r"{_LOCAL_DATA_DIR
 extxyz_path = data_dir / "{extxyz_filename}"
 
 print(f"Loading structure from {{extxyz_path}} ...")
-atoms = read(str(extxyz_path))
+atoms = read(str(extxyz_path), index=0)
 cell = atoms.get_cell()
 cell_vol = atoms.get_volume()
 symbols = np.array(atoms.get_chemical_symbols())
@@ -197,10 +200,11 @@ ti_idx = np.where(symbols == "Ti")[0]
 o_idx = np.where(symbols == "O")[0]
 h_idx = np.where(symbols == "H")[0]
 
-# Classify bulk vs water oxygen
-sorted_o_idx = o_idx[np.argsort(pos[o_idx, 2])]
-lattice_o_idx = sorted_o_idx[:120]
-water_o_idx = sorted_o_idx[120:]
+# Classify bulk vs water oxygen via PBC-aware Ti-O coordination
+from ase.neighborlist import neighbor_list
+_, j_o, _ = neighbor_list('ijd', atoms, {{('Ti', 'O'): 2.40}})
+lattice_o_idx = np.unique(j_o)
+water_o_idx = np.setdiff1d(o_idx, lattice_o_idx)
 
 r_max = {r_max}
 dr = {dr}
@@ -446,8 +450,17 @@ data_dir = Path("/data") if os.path.exists("/data") else Path(r"{_LOCAL_DATA_DIR
 extxyz_path = data_dir / "{extxyz_filename}"
 
 print(f"Loading reference structures from {{extxyz_path}} ...")
-atoms = read(str(extxyz_path))
-forces_dft = atoms.arrays.get("force", np.zeros_like(atoms.positions))
+atoms = read(str(extxyz_path), index=0)
+
+forces_dft = None
+if hasattr(atoms, "calc") and atoms.calc and "forces" in getattr(atoms.calc, "results", {{}}):
+    forces_dft = atoms.calc.results["forces"]
+elif "forces" in atoms.arrays:
+    forces_dft = atoms.arrays["forces"]
+elif "force" in atoms.arrays:
+    forces_dft = atoms.arrays["force"]
+else:
+    forces_dft = np.zeros_like(atoms.positions)
 
 # In a live evaluation, DeepPot model evaluates coordinates:
 # from deepmd.infer import DeepPot; dp = DeepPot('graph.pb'); e, f, v = dp.eval(coords, cell)
@@ -459,7 +472,9 @@ forces_dp = forces_dft + noise
 f_dft_flat = forces_dft.flatten()
 f_dp_flat = forces_dp.flatten()
 rmse_f = np.sqrt(np.mean((f_dft_flat - f_dp_flat)**2))
-r2_f = 1.0 - (np.sum((f_dft_flat - f_dp_flat)**2) / np.sum((f_dft_flat - np.mean(f_dft_flat))**2))
+ss_res = np.sum((f_dft_flat - f_dp_flat)**2)
+denom = np.sum((f_dft_flat - np.mean(f_dft_flat))**2)
+r2_f = 1.0 - (ss_res / denom) if denom > 1e-12 else 0.0
 
 print(f"Force Component Parity: RMSE = {{rmse_f:.4f}} eV/Å | R² = {{r2_f:.4f}}")
 

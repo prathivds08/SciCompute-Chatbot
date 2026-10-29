@@ -87,10 +87,15 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
 
+    _ALLOWED_JOB_COLUMNS = {
+        "slurm_job_id", "status", "submitted_at", "completed_at",
+        "params_json", "output_path", "error_message",
+    }
+
     # -- lifecycle ---------------------------------------------------
 
     def connect(self) -> "Database":
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -173,6 +178,11 @@ class Database:
         return cur.lastrowid  # type: ignore[return-value]
 
     def update_job(self, job_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        invalid = set(fields.keys()) - self._ALLOWED_JOB_COLUMNS
+        if invalid:
+            raise ValueError(f"Disallowed job update columns: {invalid}")
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [job_id]
         self.conn.execute(f"UPDATE jobs SET {set_clause} WHERE id = ?", values)

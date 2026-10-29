@@ -161,6 +161,8 @@ class CodeExecutor:
                 "duration": 0.0,
                 "artifacts": [],
             }
+
+        timeout_val = timeout or self.default_timeout
         run_id = f"shell_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         run_dir = self.base_dir / (session_id or "default") / run_id
         run_dir.mkdir(parents=True, exist_ok=True)

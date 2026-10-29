@@ -13,12 +13,15 @@ Lifespan handler bootstraps Ollama, ChromaDB, Kùzu, and SQLite on startup.
 """
 
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +34,33 @@ from backend.rag.embeddings import EmbeddingModel
 from backend.rag.hybrid_retriever import HybridRetriever
 from backend.rag.knowledge_graph import KnowledgeGraph
 from backend.rag.vectorstore import VectorStore
+from backend.sandbox.docker_runner import DockerRunner
+from backend.tools.deepmd_analysis_tools import (
+    save_analysis_script,
+    build_water_density_profile_script,
+    build_rdf_script,
+    build_extxyz_to_deepmd_raw_script,
+    build_loss_curve_script,
+    build_parity_plot_script,
+)
+from backend.tools import (
+    execute_code,
+    extract_code_blocks,
+    extract_docker_tool_calls,
+    detect_docker_intent,
+    is_followup_execution_request,
+    resolve_fallback_analysis_script,
+    format_execution_result_markdown,
+    sanitize_markdown_text,
+    web_search,
+    aweb_search,
+    fetch_web_page,
+    afetch_web_page,
+    format_web_search_markdown,
+    format_web_page_markdown,
+    extract_web_tool_calls,
+    detect_web_intent,
+)
 
 # ------------------------------------------------------------------ #
 #  Global singletons (initialised during lifespan)
@@ -110,27 +140,6 @@ app.add_middleware(
 #  Request / response models
 # ------------------------------------------------------------------ #
 
-from backend.tools import (
-    execute_code,
-    extract_code_blocks,
-    format_execution_result_markdown,
-    sanitize_markdown_text,
-)
-
-from backend.sandbox.docker_runner import DockerRunner
-from backend.tools.deepmd_analysis_tools import (
-    save_analysis_script,
-    build_water_density_profile_script,
-    build_rdf_script,
-    build_extxyz_to_deepmd_raw_script,
-    build_loss_curve_script,
-    build_parity_plot_script,
-)
-
-# ------------------------------------------------------------------ #
-#  Request / response models
-# ------------------------------------------------------------------ #
-
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
@@ -150,6 +159,16 @@ class ExecuteCodeRequest(BaseModel):
     timeout: int | None = None
     session_id: str | None = None
     save_script_name: str | None = None
+
+
+class WebSearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+class WebPageRequest(BaseModel):
+    url: str
+    max_chars: int = 4000
 
 
 class CreateAnalysisScriptRequest(BaseModel):
@@ -187,19 +206,8 @@ class InitResponse(BaseModel):
 # ------------------------------------------------------------------ #
 
 def _is_execution_request(text: str) -> bool:
-    """Check if the user prompt requests running or executing code."""
-    txt = text.lower()
-    triggers = [
-        "run the code", "run code", "run it", "run this", "execute it", "execute the code",
-        "execute this", "run by yourself", "run and give", "calculate and run", "run the script",
-        "execute the script", "run and show", "test and run", "give me the result by running",
-        "run it by yourself", "run by itself", "execute by itself", "run and tell me",
-        "execute and give", "run the python", "execute the python", "run this script",
-    ]
-    words = [w.strip(".,!?:;\"'") for w in txt.split()]
-    if set(words).intersection({"run", "execute"}) and len(words) <= 5:
-        return True
-    return any(t in txt for t in triggers)
+    """Check if the user prompt requests running or executing code in Docker."""
+    return detect_docker_intent(text)
 
 
 # ------------------------------------------------------------------ #
@@ -295,11 +303,14 @@ async def create_deepmd_script_endpoint(req: CreateAnalysisScriptRequest):
 @app.post("/api/deepmd/run-analysis")
 async def run_deepmd_analysis_endpoint(req: RunAnalysisRequest):
     """Execute a DeePMD analysis script strictly inside the isolated Docker container."""
-    sid = req.session_id or "default"
+    sid = Path(req.session_id or "default").name
     code = req.code
 
     if not code and req.script_path:
-        p = Path(req.script_path)
+        p = Path(req.script_path).resolve()
+        allowed_root = settings.SCRIPTS_DIR.resolve()
+        if not p.is_relative_to(allowed_root) or p.suffix != ".py":
+            raise HTTPException(status_code=403, detail="Access denied: script_path must reside inside SCRIPTS_DIR.")
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"Script file not found: {req.script_path}")
         code = p.read_text(encoding="utf-8")
@@ -325,7 +336,8 @@ async def list_sandbox_scripts(session_id: str | None = None):
         return []
 
     scripts = []
-    target_dirs = [base_dir / session_id] if session_id and (base_dir / session_id).exists() else [d for d in base_dir.iterdir() if d.is_dir()]
+    safe_sid = Path(session_id).name if session_id else None
+    target_dirs = [base_dir / safe_sid] if safe_sid and (base_dir / safe_sid).exists() else [d for d in base_dir.iterdir() if d.is_dir()]
     for sdir in target_dirs:
         for f in sdir.glob("*.py"):
             scripts.append({
@@ -353,77 +365,147 @@ async def chat(req: ChatRequest):
     if not db.get_session(sid):
         db.create_session(sid, title=req.message[:60])
 
-    # Check if this is a follow-up command to run code from the previous assistant message
-    stripped_cmd = req.message.strip().lower().rstrip(".,!?")
-    if stripped_cmd in {
-        "run", "run it", "run this", "run that", "execute", "execute it", "execute this",
-        "execute that", "run the code", "execute the code", "run script", "execute script"
-    }:
-        past_msgs = db.get_messages(sid)
-        # Scan backward for the most recent assistant message with an executable code block
-        for pm in reversed(past_msgs):
-            if pm.get("role") == "assistant":
-                blocks = extract_code_blocks(pm.get("content", ""))
-                executable = [b for b in blocks if b["language"] in ("python", "py", "bash", "sh")]
-                if executable:
-                    target_block = executable[0]
-                    # Persist user trigger message
-                    db.add_message(sid, "user", req.message)
-                    exec_res = execute_code(
-                        code=target_block["code"],
-                        language=target_block["language"],
-                        session_id=sid,
-                        save_script_name=f"deepmd_analysis_{int(time.time())}.py",
-                    )
-                    formatted_res = format_execution_result_markdown(exec_res)
-                    reply_text = f"Running previous `{target_block['language']}` code in the sandbox:\n\n" + formatted_res
-                    db.add_message(sid, "assistant", reply_text, agent_used="code_executor", tool_calls=[exec_res])
-                    return ChatResponse(
-                        session_id=sid,
-                        reply=reply_text,
-                        agent_used="code_executor",
-                        tool_results=[exec_res],
-                    )
+    # Case 1: Check if the user directly provided a code block in their prompt to execute
+    user_blocks = extract_code_blocks(req.message)
+    executable_user_blocks = [b for b in user_blocks if b["language"] in ("python", "py", "code")]
+    if executable_user_blocks and detect_docker_intent(req.message):
+        target_code = executable_user_blocks[0]["code"]
+        db.add_message(sid, "user", req.message)
+        exec_res = execute_code(
+            code=target_code,
+            language="python",
+            session_id=sid,
+            save_script_name=f"user_analysis_{int(time.time())}.py",
+        )
+        formatted_res = format_execution_result_markdown(exec_res)
+        reply_text = "Executed the user-provided Python script in the isolated Docker container:\n\n" + formatted_res
+        docker_tool_item = {
+            "tool": "docker_run",
+            "success": exec_res.get("success", False),
+            "duration": exec_res.get("duration", 0.0),
+            "returncode": exec_res.get("returncode", 0),
+            "stdout": exec_res.get("stdout", ""),
+            "stderr": exec_res.get("stderr", ""),
+            "artifacts": exec_res.get("artifacts", []),
+            "formatted": formatted_res,
+        }
+        db.add_message(sid, "assistant", reply_text, agent_used="docker_executor", tool_calls=[docker_tool_item])
+        return ChatResponse(
+            session_id=sid,
+            reply=reply_text,
+            agent_used="docker_executor",
+            tool_results=[docker_tool_item],
+        )
 
-    # Persist user message
-    db.add_message(sid, "user", req.message)
+    # Case 2: Check if this is a follow-up command to run code from the conversation history
+    if is_followup_execution_request(req.message):
+        past_msgs = db.get_messages(sid)
+        target_block = None
+        # Scan backward for the most recent message with an executable Python code block
+        for pm in reversed(past_msgs):
+            blocks = extract_code_blocks(pm.get("content", ""))
+            executable = [b for b in blocks if b["language"] in ("python", "py", "code")]
+            if executable:
+                target_block = executable[0]
+                break
+
+        # Fallback to standard template if no code in history but specific analysis requested
+        if not target_block:
+            fallback_template = resolve_fallback_analysis_script(req.message)
+            if fallback_template:
+                target_block = {"language": "python", "code": fallback_template}
+
+        if target_block:
+            db.add_message(sid, "user", req.message)
+            exec_res = execute_code(
+                code=target_block["code"],
+                language="python",
+                session_id=sid,
+                save_script_name=f"deepmd_analysis_{int(time.time())}.py",
+            )
+            formatted_res = format_execution_result_markdown(exec_res)
+            reply_text = f"Running Python code in the isolated Docker container:\n\n" + formatted_res
+            docker_tool_item = {
+                "tool": "docker_run",
+                "success": exec_res.get("success", False),
+                "duration": exec_res.get("duration", 0.0),
+                "returncode": exec_res.get("returncode", 0),
+                "stdout": exec_res.get("stdout", ""),
+                "stderr": exec_res.get("stderr", ""),
+                "artifacts": exec_res.get("artifacts", []),
+                "formatted": formatted_res,
+            }
+            db.add_message(sid, "assistant", reply_text, agent_used="docker_executor", tool_calls=[docker_tool_item])
+            return ChatResponse(
+                session_id=sid,
+                reply=reply_text,
+                agent_used="docker_executor",
+                tool_results=[docker_tool_item],
+            )
 
     wants_execution = _is_execution_request(req.message)
 
-    # Retrieve prior conversation history (excluding the current user message)
+    # Retrieve prior conversation history (excluding the current uncommitted turn)
     past_msgs = db.get_messages(sid)
     conversation_history = [
         {"role": m["role"], "content": m["content"]}
-        for m in past_msgs[:-1]
+        for m in past_msgs
         if m.get("role") in ("user", "assistant")
     ]
 
-    # 1. Zero-shot Baseline mode (No RAG access)
+    # 1. Zero-shot Baseline mode (No RAG access, but with Live Web Tools & Docker)
     if req.mode == "baseline":
         assert baseline_agent is not None
-        reply_text = await baseline_agent.agenerate_response(
-            req.message,
-            conversation_history=conversation_history,
-        )
-        reply_text = sanitize_markdown_text(reply_text)
-        agent_used = "baseline_zero_shot"
-        tool_results = None
+        try:
+            reply_text, web_tool_results, agent_used = await baseline_agent.agenerate_response_with_tools(
+                req.message,
+                conversation_history=conversation_history,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Ollama LLM service error: {exc}",
+            ) from exc
 
-        if wants_execution:
+        reply_text = sanitize_markdown_text(reply_text)
+        tool_results = list(web_tool_results) if web_tool_results else None
+
+        docker_calls = extract_docker_tool_calls(reply_text)
+        if not docker_calls and wants_execution:
             blocks = extract_code_blocks(reply_text)
-            executable_blocks = [b for b in blocks if b["language"] in ("python", "py", "bash", "sh")]
+            executable_blocks = [b for b in blocks if b["language"] in ("python", "py", "code")]
             if executable_blocks:
-                target_block = executable_blocks[0]
+                docker_calls = [executable_blocks[0]["code"]]
+            else:
+                fallback_template = resolve_fallback_analysis_script(req.message)
+                if fallback_template:
+                    docker_calls = [fallback_template]
+
+        if docker_calls:
+            agent_used = "docker_executor"
+            for code_snippet in docker_calls:
                 exec_res = execute_code(
-                    code=target_block["code"],
-                    language=target_block["language"],
+                    code=code_snippet,
+                    language="python",
                     session_id=sid,
+                    save_script_name=f"baseline_analysis_{int(time.time())}.py",
                 )
                 formatted_res = format_execution_result_markdown(exec_res)
                 reply_text += "\n\n---\n" + formatted_res
-                agent_used = "code_executor"
-                tool_results = [exec_res]
+                if tool_results is None:
+                    tool_results = []
+                tool_results.append({
+                    "tool": "docker_run",
+                    "success": exec_res.get("success", False),
+                    "duration": exec_res.get("duration", 0.0),
+                    "returncode": exec_res.get("returncode", 0),
+                    "stdout": exec_res.get("stdout", ""),
+                    "stderr": exec_res.get("stderr", ""),
+                    "artifacts": exec_res.get("artifacts", []),
+                    "formatted": formatted_res,
+                })
 
+        db.add_message(sid, "user", req.message)
         db.add_message(sid, "assistant", reply_text, agent_used=agent_used, tool_calls=tool_results)
         return ChatResponse(
             session_id=sid,
@@ -432,13 +514,68 @@ async def chat(req: ChatRequest):
             tool_results=tool_results,
         )
 
-    # 2. RAG mode (VectorStore + Knowledge Graph context)
+    # 2. RAG mode (VectorStore + Knowledge Graph context + Live Web Tools)
     assert retriever is not None
     context = retriever.retrieve(req.message)
     context_str = retriever.format_context_for_prompt(context)
 
-    # Generate response via Ollama
-    import httpx
+    # Proactive web intent detection for RAG
+    needs_web, web_action, web_target = detect_web_intent(req.message)
+    web_tool_results: list[dict[str, Any]] = []
+    web_context_blocks: list[str] = []
+
+    if needs_web and web_target:
+        if web_action == "search":
+            search_res = await aweb_search(web_target, max_results=5)
+            formatted_web = format_web_search_markdown(web_target, search_res)
+            web_tool_results.append({
+                "tool": "web_search",
+                "query": web_target,
+                "results": search_res,
+                "formatted": formatted_web,
+            })
+            web_context_blocks.append(formatted_web)
+        elif web_action == "fetch":
+            page_res = await afetch_web_page(web_target, max_chars=4000)
+            formatted_web = format_web_page_markdown(page_res)
+            web_tool_results.append({
+                "tool": "fetch_url",
+                "url": web_target,
+                "page": page_res,
+                "formatted": formatted_web,
+            })
+            web_context_blocks.append(formatted_web)
+
+    web_tools_guidelines = (
+        "\nLIVE WEB TOOLS & INTERNET ACCESS:\n"
+        "You have real-time access to the live web and online documentation:\n"
+        "- Web search: emit `<web_search>query</web_search>` to look up live documentation, releases, or papers.\n"
+        "- Webpage fetch: emit `<fetch_url>https://example.com</fetch_url>` to read text from a URL.\n"
+        "When <live_web_context> is provided, synthesize its information directly into your answer."
+    )
+
+    docker_tools_guidelines = (
+        "\nLIVE DOCKER CONTAINER EXECUTION TOOL:\n"
+        "You have access to an isolated, secure Docker execution container (`deepmd-analysis-sandbox`).\n"
+        "The structure dataset is mounted read-only at `/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz` "
+        "(or `DATA_DIR / 'Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz'`).\n\n"
+        "To execute scientific analysis, compute interfacial properties (forces, density profiles, RDF, "
+        "DeePMD dataset conversions, etc.), or generate graphical plots:\n"
+        "Emit your complete Python script inside `<docker_run>...</docker_run>` tags:\n"
+        "<docker_run>\n"
+        "# Complete, self-contained Python script\n"
+        "import os, sys, math\n"
+        "from pathlib import Path\n"
+        "import numpy as np\n"
+        "import matplotlib\n"
+        "matplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "from ase.io import read\n"
+        "...\n"
+        "</docker_run>\n\n"
+        "The backend will execute your script in the secure Docker container, capture stdout and generated figures, "
+        "and return the live execution output."
+    )
 
     data_isolation_policy = (
         "\nDATA PRIVACY & ISOLATION POLICY:\n"
@@ -451,38 +588,51 @@ async def chat(req: ChatRequest):
     execution_instruction = ""
     if wants_execution:
         execution_instruction = (
-            "\nIMPORTANT: The user has requested to run/execute code or perform analysis. Provide a complete, self-contained, "
-            "executable Python script in a ```python ... ``` block.\n"
+            "\nCRITICAL DIRECTIVE -- USER REQUESTED CODE EXECUTION IN DOCKER:\n"
+            "The user explicitly used an execution keyword (e.g. 'run', 'execute', 'calculate', 'compute', 'simulate') in Docker.\n"
+            "You MUST NOT just explain theory or output an unexecutable snippet.\n"
+            "You MUST output a complete, executable Python script inside a `<docker_run>...</docker_run>` block (or ```python ... ``` block).\n"
+            "- List 'Required Imports:' before opening the block.\n"
+            "- Start with the Mandatory Standard Scientific Prelude.\n"
             "- For interfacial and DeePMD analysis on Anatase TiO2, call the structure file at "
             "'/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz' (or DATA_DIR / 'Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz').\n"
             "- Always use print() statements to report key numerical metrics and findings to stdout.\n"
-            "- If graphical representations or plots are requested, use matplotlib.pyplot to create clear, titled, labeled figures.\n"
-            "The backend will automatically save your script as a Python file and run it inside the isolated Docker container.\n"
+            "- If graphical representations or plots are requested, use matplotlib.pyplot to save figures to 'figure_output.png'.\n"
+            "The backend will automatically execute your script inside the isolated Docker container and return the live execution outputs.\n"
         )
 
     ase_guidelines = (
         "\nASE CODING RULES -- MANDATORY SPOONFED TEMPLATE (CRITICAL API RETURN TYPES):\n"
         "---------------------------------------------------------------------------------\n"
-        "CANONICAL SINGLE STRUCTURE LOADING PATTERN (ALWAYS USE THIS FOR EXTXYZ INSPECTION):\n"
-        "```python\n"
-        "from ase.io import read\n"
-        "# ALWAYS use index=0 to load a single Atoms object:\n"
-        "atoms = read(str(file_path), index=0)\n"
-        "# Now all Atoms methods work directly:\n"
-        "positions = atoms.get_positions()            # Shape (N, 3) in Angstrom\n"
-        "symbols = atoms.get_chemical_symbols()        # List of element symbols ['Ti', 'O', 'H']\n"
-        "cell = atoms.cell                            # 3x3 Lattice Cell\n"
-        "scaled = atoms.get_scaled_positions(wrap=True) # Fractional coordinates in [0, 1)\n"
-        "atom_count = len(atoms)                      # ALWAYS use len(atoms)\n"
-        "```\n"
-        "CRITICAL ERROR PREVENTION (STRICTLY FORBIDDEN ANTI-PATTERNS):\n"
-        "- NEVER pass index=':' when inspecting or analyzing a structure!\n"
-        "  'read(path, index=\":\")' returns a Python list[Atoms], NOT an Atoms object.\n"
-        "  Calling atoms.get_positions() or atoms.cell on a list CRASHES with:\n"
-        "  AttributeError: 'list' object has no attribute 'get_positions'\n"
-        "- If inspecting a structure, boundary atoms, surface atoms, or properties: ALWAYS USE index=0.\n"
-        "- NEVER use atoms.get_count(), atoms.num_atoms(), or atoms.count() (DO NOT EXIST; use len(atoms)).\n"
-        "- Potential energy: atoms.get_potential_energy() [eV]. Convert to Hartree: energy_eV / Hartree.\n"
+        "1. STRUCTURE I/O (from ase.io import read, write):\n"
+        "   - ALWAYS use index=0 to load a single Atoms object: atoms = read(str(file_path), index=0)\n"
+        "   - NEVER pass index=':' when inspecting or analyzing a structure! 'read(path, index=\":\")' returns list[Atoms], NOT an Atoms object.\n"
+        "     Calling atoms.get_positions() on a list crashes with: AttributeError: 'list' object has no attribute 'get_positions'.\n"
+        "   - To write/save structures, construct a new `ase.Atoms` object and call `write()`:\n"
+        "     from ase import Atoms\n"
+        "     from ase.io import write\n"
+        "     new_atoms = Atoms(symbols=symbols, positions=positions, cell=atoms.cell, pbc=atoms.pbc)\n"
+        "     write('boundary_atoms.extxyz', new_atoms)\n"
+        "   - FATAL ERROR: The variable `atoms` returned by read() is an instance. NEVER call `atoms(...)` (TypeError: 'Atoms' object is not callable).\n"
+        "   - ALWAYS use len(atoms) for atom count (NEVER atoms.get_count(), atoms.num_atoms(), or atoms.count()).\n"
+        "2. DISTANCES (from ase.geometry import get_distances):\n"
+        "   - Exact Signature: disp_vecs, dist_matrix = get_distances(p1, p2=None, cell=atoms.cell, pbc=atoms.pbc)\n"
+        "   - FATAL ERROR: NEVER pass 'mic=True' to get_distances()! It raises TypeError: get_distances() got an unexpected keyword argument 'mic'.\n"
+        "     Minimum Image Convention is automatically applied when cell and pbc are supplied.\n"
+        "   - Return Value: get_distances() returns a 2-tuple (displacement_vectors, distances). Extract scalar distances with:\n"
+        "     dist_matrix = get_distances(p1, p2, cell=atoms.cell, pbc=atoms.pbc)[1]\n"
+        "   - For all-pairs distance on Atoms: dists = atoms.get_all_distances(mic=True) (directly returns (N, N) array).\n"
+        "3. NEIGHBOR LISTS (from ase.neighborlist import neighbor_list):\n"
+        "   - Exact Signature: i_idx, j_idx, d_ij = neighbor_list('ijd', atoms, cutoff=...)\n"
+        "   - Pairwise cutoffs dict MUST include both directions: {('O', 'H'): 1.20, ('H', 'O'): 1.20, ('Ti', 'O'): 2.50, ('O', 'Ti'): 2.50}.\n"
+        "   - Separate water O from lattice O: water oxygens have covalent O-H bonds (< 1.20 A):\n"
+        "     i_oh, _, _ = neighbor_list('ijd', atoms, {('O', 'H'): 1.20, ('H', 'O'): 1.20})\n"
+        "     water_o_idx = np.unique(i_oh[symbols[i_oh] == 'O'])\n"
+        "     lattice_o_idx = np.setdiff1d(np.where(symbols == 'O')[0], water_o_idx)\n"
+        "4. UNITS & CONVERSIONS (from ase.units import Hartree):\n"
+        "   - Potential energy in Hartree: energy_Ha = atoms.get_potential_energy() / Hartree\n"
+        "   - Forces in Hartree/Bohr: forces_Ha_Bohr = atoms.get_forces() / (Hartree / Bohr)\n"
+        "   - FATAL ERROR: Never import Avogadro from ase.units (does NOT exist; use NA = 6.02214076e23).\n"
     )
 
     numpy_guidelines = (
@@ -532,81 +682,351 @@ async def chat(req: ChatRequest):
     )
 
     code_generation_mandate = (
-        "\nCODE GENERATION MANDATE:\n"
-        "- If providing Python code, always provide a complete, self-contained, immediately executable script.\n"
-        "- Structure reading MUST follow: 'atoms = ase.io.read(path, index=0)'. NEVER use index=':' for single structures.\n"
+        "\nCODE GENERATION & MANDATORY IMPORT PRELUDE:\n"
+        "- Before writing a ```python ... ``` block, state a 1-line 'Required Imports:' list naming every module and function used.\n"
+        "- Every Python script MUST be 100% self-contained and MUST start with these explicit top-level imports:\n"
+        "```python\n"
+        "import os\n"
+        "import sys\n"
+        "import json\n"
+        "import math\n"
+        "from pathlib import Path\n"
+        "import numpy as np\n"
+        "import matplotlib\n"
+        "matplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "from ase.io import read, write\n"
+        "from ase.geometry import get_distances\n"
+        "from ase.neighborlist import neighbor_list, NeighborList\n"
+        "from ase.units import Hartree, Bohr, mol, kJ, fs\n"
+        "```\n"
+        "- Structure reading MUST follow: 'atoms = read(str(DATA_PATH), index=0)' for single structures.\n"
         "- Dual-path fallback for dataset loading:\n"
         "    CONTAINER_PATH = Path('/data/Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz')\n"
         "    LOCAL_PATH = Path(__file__).resolve().parent / 'data' / 'Anatase_TiO2_Water_MolecularAdsorbedWater.extxyz'\n"
         "    DATA_PATH = CONTAINER_PATH if CONTAINER_PATH.exists() else LOCAL_PATH\n"
     )
 
-    system_prompt = (
-        "You are a scientific computing assistant specialising in DFT (Quantum ESPRESSO), "
-        "DeePMD-kit model training, LAMMPS molecular dynamics, and post-processing analysis "
-        "of metal-oxide/water interfaces.\n\n"
-        f"{data_isolation_policy}"
-        f"{ase_guidelines}"
-        f"{numpy_guidelines}"
-        f"{surface_boundary_rules}"
-        f"{anatase_physics_and_models}"
-        f"{code_generation_mandate}"
-        f"{execution_instruction}"
-        "Use the following retrieved context to help answer the user's question. "
-        "If the context doesn't contain the answer, say so and use your own knowledge.\n\n"
-        f"--- RETRIEVED CONTEXT ---\n{context_str}\n--- END CONTEXT ---"
+    # ---- Upgrade 6: Dynamic intent-based system prompt modularisation ----
+    # Only inject the heavyweight physics/boundary blocks when the query
+    # is actually about Anatase TiO2 / interfacial analysis. For DFT
+    # convergence (Pt), LAMMPS batch scripts, or training questions,
+    # those ~900 tokens of Anatase context actively hurt qwen2.5-coder:7b
+    # by confusing Ti/IrO2 parameters with Pt or Water ones.
+    q_low = req.message.lower()
+    is_anatase_or_interface = any(
+        k in q_low for k in (
+            "anatase", "tio2", "titanium", "extxyz", "boundary", "surface",
+            "slab", "hydration", "density", "rdf", "radial", "survival",
+            "hydroxyl", "interfacial", "water interface",
+        )
     )
+    is_code_or_ase = wants_execution or any(
+        k in q_low for k in (
+            "code", "script", "python", "ase", "numpy", "plot", "read",
+            "extxyz", "cif", "calculate", "compute", "write", "generate",
+        )
+    )
+
+    prompt_sections: list[str] = [
+        (
+            "You are a scientific computing assistant specialising in DFT (Quantum ESPRESSO), "
+            "DeePMD-kit model training, LAMMPS molecular dynamics, and post-processing analysis "
+            "of metal-oxide/water interfaces."
+        ),
+        data_isolation_policy,
+        web_tools_guidelines,
+        docker_tools_guidelines,
+    ]
+
+    if is_code_or_ase:
+        prompt_sections.extend([ase_guidelines, numpy_guidelines, code_generation_mandate])
+    if is_anatase_or_interface:
+        prompt_sections.extend([surface_boundary_rules, anatase_physics_and_models])
+    if wants_execution:
+        prompt_sections.append(execution_instruction)
+
+    if web_context_blocks:
+        joined_web = "\n\n".join(web_context_blocks)
+        prompt_sections.append(
+            f"<live_web_context>\n{joined_web}\n</live_web_context>"
+        )
+
+    prompt_sections.append(
+        "Prioritize the facts, parameters, and code patterns inside <retrieved_context>. "
+        "When citing pseudopotentials, cutoffs, type_maps, or script templates, "
+        "use the exact values from <retrieved_context>.\n\n"
+        f"{context_str}"
+    )
+
+    system_prompt = "\n\n".join(prompt_sections)
+
+    user_content = req.message
+    if is_code_or_ase:
+        user_content = (
+            f"{req.message}\n\n"
+            "[Mandatory Code Checklist:\n"
+            "1. First list 'Required Imports:' before the code block.\n"
+            "2. Start the ```python block with explicit imports: `import os, sys, json, math`, `from pathlib import Path`, "
+            "`import numpy as np`, `import matplotlib.pyplot as plt`, `from ase.io import read, write`, "
+            "`from ase.geometry import get_distances`, `from ase.neighborlist import neighbor_list`, `from ase.units import Hartree`.\n"
+            "3. Use `read(str(DATA_PATH), index=0)` for single structures, `len(atoms)`, `np.any()`, and save figures to `figure_output.png`.]"
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
         *conversation_history,
-        {"role": "user", "content": req.message},
+        {"role": "user", "content": user_content},
     ]
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        ollama_resp = await client.post(
-            f"{settings.OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": settings.MODEL_NAME,
-                "messages": messages,
-                "stream": False,
-                "options": {
-                    "num_ctx": 32768,
-                    "temperature": 0.6,
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            ollama_resp = await client.post(
+                f"{settings.OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": settings.MODEL_NAME,
+                    "messages": messages,
+                    "stream": False,
+                    # Upgrade 7: Tuned inference options for qwen2.5-coder:7b
+                    # - temperature 0.1: eliminates stochastic hallucinations in grounded RAG QA
+                    # - num_ctx 16384: covers system prompt + 5 chunks + history + full script
+                    #   while halving KV-cache overhead vs 32768, improving time-to-first-token
+                    # - top_p / top_k / repeat_penalty: standard quality settings
+                    "options": {
+                        "num_ctx": settings.LLM_NUM_CTX,
+                        "temperature": 0.1,
+                        "top_p": 0.9,
+                        "top_k": 20,
+                        "repeat_penalty": 1.05,
+                    },
                 },
-            },
-        )
-        if ollama_resp.status_code >= 400:
-            import sys
-            print(
-                f"[Chat API] Ollama returned {ollama_resp.status_code} for model '{settings.MODEL_NAME}':\n"
-                f"  Response: {ollama_resp.text[:500]}",
-                file=sys.stderr,
             )
-        ollama_resp.raise_for_status()
-        reply_text = ollama_resp.json()["message"]["content"]
-        reply_text = sanitize_markdown_text(reply_text)
+            if ollama_resp.status_code >= 400:
+                import sys
+                print(
+                    f"[Chat API] Ollama returned {ollama_resp.status_code} for model '{settings.MODEL_NAME}':\n"
+                    f"  Response: {ollama_resp.text[:500]}",
+                    file=sys.stderr,
+                )
+            ollama_resp.raise_for_status()
+            reply_text = ollama_resp.json()["message"]["content"]
+            reply_text = sanitize_markdown_text(reply_text)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama LLM service error: {exc}",
+        ) from exc
 
-    agent_used = "qa_rag"
-    tool_results = None
+    agent_used = "rag_web_agent" if web_tool_results else "qa_rag"
+    tool_results = list(web_tool_results) if web_tool_results else None
 
-    if wants_execution:
+    # Check for reactive tool calls emitted by the model
+    model_web_calls = extract_web_tool_calls(reply_text)
+    if model_web_calls:
+        agent_used = "rag_web_agent"
+        new_web_outputs: list[str] = []
+        for call in model_web_calls:
+            t_type = call.get("tool")
+            arg = call.get("argument", "")
+            if t_type == "web_search":
+                s_res = await aweb_search(arg, max_results=5)
+                fmt = format_web_search_markdown(arg, s_res)
+                if tool_results is None:
+                    tool_results = []
+                tool_results.append({
+                    "tool": "web_search",
+                    "query": arg,
+                    "results": s_res,
+                    "formatted": fmt,
+                })
+                new_web_outputs.append(fmt)
+            elif t_type == "fetch_url":
+                p_res = await afetch_web_page(arg, max_chars=4000)
+                fmt = format_web_page_markdown(p_res)
+                if tool_results is None:
+                    tool_results = []
+                tool_results.append({
+                    "tool": "fetch_url",
+                    "url": arg,
+                    "page": p_res,
+                    "formatted": fmt,
+                })
+                new_web_outputs.append(fmt)
+
+        if new_web_outputs:
+            web_followup_messages = [
+                *messages,
+                {"role": "assistant", "content": reply_text},
+                {
+                    "role": "user",
+                    "content": (
+                        "Live Web Tool Results:\n\n"
+                        + "\n\n".join(new_web_outputs)
+                        + "\n\nPlease provide your final answer to the user synthesizing these results. "
+                        "Do not output raw tool tags."
+                    ),
+                },
+            ]
+            async with httpx.AsyncClient(timeout=None) as client:
+                synth_resp = await client.post(
+                    f"{settings.OLLAMA_BASE_URL}/api/chat",
+                    json={
+                        "model": settings.MODEL_NAME,
+                        "messages": web_followup_messages,
+                        "stream": False,
+                        "options": {
+                            "num_ctx": settings.LLM_NUM_CTX,
+                            "temperature": 0.1,
+                            "top_p": 0.9,
+                            "top_k": 20,
+                            "repeat_penalty": 1.05,
+                        },
+                    },
+                )
+                if synth_resp.status_code < 400:
+                    reply_text = sanitize_markdown_text(
+                        synth_resp.json()["message"]["content"]
+                    )
+
+    # Clean any residual tool tags
+    reply_text = re.sub(
+        r'<(?:web_search|fetch_url)>.*?</(?:web_search|fetch_url)>',
+        '',
+        reply_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
+    docker_tool_calls = extract_docker_tool_calls(reply_text)
+    if not docker_tool_calls and wants_execution:
         blocks = extract_code_blocks(reply_text)
-        executable_blocks = [b for b in blocks if b["language"] in ("python", "py", "bash", "sh")]
+        executable_blocks = [b for b in blocks if b["language"] in ("python", "py", "code")]
         if executable_blocks:
-            target_block = executable_blocks[0]
+            docker_tool_calls = [executable_blocks[0]["code"]]
+        else:
+            fallback_template = resolve_fallback_analysis_script(req.message)
+            if fallback_template:
+                docker_tool_calls = [fallback_template]
+
+    if docker_tool_calls:
+        agent_used = "docker_executor"
+        for code_snippet in docker_tool_calls:
             exec_res = execute_code(
-                code=target_block["code"],
-                language=target_block["language"],
+                code=code_snippet,
+                language="python",
                 session_id=sid,
                 save_script_name=f"deepmd_analysis_{int(time.time())}.py",
             )
-            formatted_res = format_execution_result_markdown(exec_res)
-            reply_text += "\n\n---\n" + formatted_res
-            agent_used = "code_executor"
-            tool_results = [exec_res]
 
-    # Persist assistant reply
+            # Upgrade 7: 1-step self-correction loop.
+            # If the container execution failed with a real Python traceback
+            # (not a policy-blocked execution), ask the model to repair its code once.
+            if not exec_res["success"] and "EXECUTION BLOCKED" not in exec_res.get("stderr", ""):
+                repair_messages = [
+                    *messages,
+                    {"role": "assistant", "content": reply_text},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your script failed in the Docker container with the following error:\n"
+                            f"```text\n{exec_res['stderr'][:2000]}\n```\n"
+                            "Provide the corrected, complete, self-contained Python script "
+                            "in a <docker_run>...</docker_run> block."
+                        ),
+                    },
+                ]
+                async with httpx.AsyncClient(timeout=None) as repair_client:
+                    repair_resp = await repair_client.post(
+                        f"{settings.OLLAMA_BASE_URL}/api/chat",
+                        json={
+                            "model": settings.MODEL_NAME,
+                            "messages": repair_messages,
+                            "stream": False,
+                            "options": {"num_ctx": settings.LLM_NUM_CTX, "temperature": 0.05},
+                        },
+                    )
+                    if repair_resp.status_code < 400:
+                        repaired_text = sanitize_markdown_text(
+                            repair_resp.json()["message"]["content"]
+                        )
+                        repaired_docker = extract_docker_tool_calls(repaired_text)
+                        if not repaired_docker:
+                            repaired_blocks = [
+                                b for b in extract_code_blocks(repaired_text)
+                                if b["language"] in ("python", "py")
+                            ]
+                            if repaired_blocks:
+                                repaired_docker = [repaired_blocks[0]["code"]]
+                        if repaired_docker:
+                            reply_text = repaired_text
+                            exec_res = execute_code(
+                                code=repaired_docker[0],
+                                language="python",
+                                session_id=sid,
+                                save_script_name=f"deepmd_analysis_repaired_{int(time.time())}.py",
+                            )
+                            agent_used = "docker_executor"
+
+            formatted_res = format_execution_result_markdown(exec_res)
+
+            # If the model emitted an explicit <docker_run> tag and succeeded, synthesize the results
+            has_explicit_docker_tag = bool(extract_docker_tool_calls(reply_text))
+            if has_explicit_docker_tag and exec_res.get("success"):
+                synth_messages = [
+                    *messages,
+                    {"role": "assistant", "content": reply_text},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Live Docker Container Execution Results:\n\n"
+                            f"Status: Succeeded ({exec_res.get('duration', 0.0)}s)\n"
+                            f"Console Output (stdout):\n```text\n{exec_res.get('stdout', '')[:4000]}\n```\n"
+                            + (f"Generated {len(exec_res.get('artifacts', []))} visual plots.\n" if exec_res.get("artifacts") else "")
+                            + "\nPlease provide your final response to the user synthesizing these live computation results. "
+                            "Report the exact numerical findings calculated inside Docker. "
+                            "Do not output raw tool tags."
+                        ),
+                    },
+                ]
+                async with httpx.AsyncClient(timeout=None) as client:
+                    synth_resp = await client.post(
+                        f"{settings.OLLAMA_BASE_URL}/api/chat",
+                        json={
+                            "model": settings.MODEL_NAME,
+                            "messages": synth_messages,
+                            "stream": False,
+                            "options": {
+                                "num_ctx": settings.LLM_NUM_CTX,
+                                "temperature": 0.1,
+                            },
+                        },
+                    )
+                    if synth_resp.status_code < 400:
+                        reply_text = sanitize_markdown_text(synth_resp.json()["message"]["content"])
+
+            # Clean any residual docker tool tags
+            reply_text = re.sub(
+                r'<(?:docker_run|docker_exec|run_docker|call_docker|docker)>[\s\S]*?</(?:docker_run|docker_exec|run_docker|call_docker|docker)>',
+                '',
+                reply_text,
+                flags=re.IGNORECASE,
+            ).strip()
+
+            reply_text += "\n\n---\n" + formatted_res
+            if tool_results is None:
+                tool_results = []
+            tool_results.append({
+                "tool": "docker_run",
+                "success": exec_res.get("success", False),
+                "duration": exec_res.get("duration", 0.0),
+                "returncode": exec_res.get("returncode", 0),
+                "stdout": exec_res.get("stdout", ""),
+                "stderr": exec_res.get("stderr", ""),
+                "artifacts": exec_res.get("artifacts", []),
+                "formatted": formatted_res,
+            })
+
+    # Persist user message and assistant reply together
+    db.add_message(sid, "user", req.message)
     db.add_message(sid, "assistant", reply_text, agent_used=agent_used, tool_calls=tool_results)
 
     return ChatResponse(
@@ -622,6 +1042,30 @@ async def chat_baseline(req: ChatRequest):
     """Dedicated endpoint for zero-shot baseline evaluations without RAG."""
     req.mode = "baseline"
     return await chat(req)
+
+
+@app.post("/api/tools/web_search")
+async def api_web_search(req: WebSearchRequest):
+    """Execute a live web search using DuckDuckGo with fallback cascade."""
+    results = await aweb_search(req.query, max_results=req.max_results)
+    markdown = format_web_search_markdown(req.query, results)
+    return {
+        "query": req.query,
+        "results": results,
+        "markdown": markdown,
+    }
+
+
+@app.post("/api/tools/fetch_web_page")
+async def api_fetch_web_page(req: WebPageRequest):
+    """Fetch and extract clean readable text from a URL."""
+    page = await afetch_web_page(req.url, max_chars=req.max_chars)
+    markdown = format_web_page_markdown(page)
+    return {
+        "url": req.url,
+        "page": page,
+        "markdown": markdown,
+    }
 
 
 @app.get("/api/sessions")
@@ -668,12 +1112,13 @@ async def websocket_chat(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_text()
-            msg = json.loads(data)
-
-            # For now, just echo back through the REST chat logic
-            req = ChatRequest(**msg)
-            response = await chat(req)
-            await ws.send_text(response.model_dump_json())
+            try:
+                msg = json.loads(data)
+                req = ChatRequest(**msg)
+                response = await chat(req)
+                await ws.send_text(response.model_dump_json())
+            except Exception as exc:
+                await ws.send_text(json.dumps({"error": str(exc)}))
     except WebSocketDisconnect:
         pass
 
@@ -685,6 +1130,10 @@ async def websocket_chat(ws: WebSocket):
 frontend_dir = settings.WORKSPACE_ROOT / "frontend"
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+else:
+    @app.get("/")
+    async def root_fallback():
+        return await api_status()
 
 
 # ------------------------------------------------------------------ #
@@ -699,4 +1148,6 @@ if __name__ == "__main__":
         host=settings.HOST,
         port=settings.PORT,
         reload=True,
+        reload_dirs=["backend"],
+        reload_excludes=["*.db*", "*.wal*", "*.shm*", "backend/data/*"],
     )

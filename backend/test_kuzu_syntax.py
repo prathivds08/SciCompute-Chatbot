@@ -29,7 +29,21 @@ try:
 except Exception as e:
     print(f"2. FAILED: {e}")
 
+# Test with Step node table (multiple parameters)
+try:
+    c.execute("CREATE NODE TABLE IF NOT EXISTS Step(name STRING, script_template STRING, default_params STRING, step_order INT64, PRIMARY KEY(name))")
+    c.execute(
+        "MERGE (s:Step {name: $name}) "
+        "ON CREATE SET s.script_template = $description, s.default_params = $params, s.step_order = $step_order "
+        "ON MATCH SET s.script_template = $description, s.default_params = $params, s.step_order = $step_order",
+        parameters={"name": "dft__parse_structure", "description": "CIF parsing via ASE", "params": "", "step_order": 0}
+    )
+    print("3. MERGE with $params and $step_order: OK")
+except Exception as e:
+    print(f"3. FAILED: {e}")
+
 # Read back
 res = c.execute("MATCH (w:W) RETURN w.name, w.description")
 while res.has_next():
     print(f"   Row: {res.get_next()}")
+

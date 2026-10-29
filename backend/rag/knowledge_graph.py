@@ -13,12 +13,16 @@ Pre-populated with domain knowledge from the existing project notebooks
 (pseudopotential mappings, type maps, temperatures, workflow sequences).
 """
 
+import logging
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
 import kuzu
 
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeGraph:
@@ -28,9 +32,41 @@ class KnowledgeGraph:
         self.db_dir = db_dir or settings.KUZU_DB_DIR
         # Kùzu manages the DB path itself; only ensure the parent dir exists
         self.db_dir.parent.mkdir(parents=True, exist_ok=True)
-        self._db = kuzu.Database(str(self.db_dir))
-        self._conn = kuzu.Connection(self._db)
+        try:
+            self._db = kuzu.Database(str(self.db_dir))
+            self._conn = kuzu.Connection(self._db)
+        except (IndexError, RuntimeError, Exception) as exc:
+            msg = str(exc).lower()
+            if "lock on file" in msg or "could not set lock" in msg or "permission denied" in msg:
+                # Active server process holds the lock; do not purge active files
+                raise
+            logger.warning(
+                "Kùzu database files at '%s' encountered an initialization error (%s: %s). "
+                "Purging corrupted WAL/storage files and recreating database cleanly...",
+                self.db_dir,
+                type(exc).__name__,
+                exc,
+            )
+            self._purge_db_files()
+            self._db = kuzu.Database(str(self.db_dir))
+            self._conn = kuzu.Connection(self._db)
+
         self._ensure_schema()
+
+    def _purge_db_files(self) -> None:
+        """Purge corrupted or uncheckpointed Kùzu database files from disk."""
+        if self.db_dir.is_dir():
+            shutil.rmtree(self.db_dir, ignore_errors=True)
+        parent = self.db_dir.parent
+        stem = self.db_dir.name
+        for p in parent.glob(f"{stem}*"):
+            try:
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+                elif p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     #  Schema
@@ -76,6 +112,7 @@ class KnowledgeGraph:
                 name STRING,
                 script_template STRING,
                 default_params STRING,
+                step_order INT64,
                 PRIMARY KEY (name)
             )
         """)
@@ -107,6 +144,15 @@ class KnowledgeGraph:
         self._safe_exec("CREATE REL TABLE IF NOT EXISTS TRAINED_WITH   (FROM System   TO DPModel)")
         self._safe_exec("CREATE REL TABLE IF NOT EXISTS HAS_TRAJECTORY (FROM System   TO Trajectory)")
 
+        # ---- Schema migrations for existing databases ----
+        # Ensures step_order exists on Step if the table predated this field
+        try:
+            step_cols = [r.get("name") for r in self.query("CALL table_info('Step') RETURN name")]
+            if "step_order" not in step_cols:
+                self._safe_exec("ALTER TABLE Step ADD step_order INT64 DEFAULT 0")
+        except Exception:
+            self._safe_exec("ALTER TABLE Step ADD step_order INT64 DEFAULT 0")
+
     # ------------------------------------------------------------------ #
     #  Domain data population
     # ------------------------------------------------------------------ #
@@ -125,6 +171,11 @@ class KnowledgeGraph:
             ("H",  "Hydrogen",   "",         "H_ONCV_PBE-1.2.upf",   "ONCV",  "PBE"),
             ("O",  "Oxygen",     "",         "O_ONCV_PBE-1.2.upf",   "ONCV",  "PBE"),
             ("C",  "Carbon",     "",         "C_ONCV_PBE-1.2.upf",   "ONCV",  "PBE"),
+            # Upgrade 4: Added missing materials used in project workflows
+            ("Ti", "Titanium",   "",         "Ti_ONCV_PBE-1.2.upf",  "ONCV",  "PBE"),
+            ("Si", "Silicon",    "",         "Si_ONCV_PBE-1.2.upf",  "ONCV",  "PBE"),
+            ("Mg", "Magnesium",  "",         "Mg_ONCV_PBE-1.2.upf",  "ONCV",  "PBE"),
+            ("Ru", "Ruthenium",  "",         "Ru_ONCV_PBE-1.2.upf",  "ONCV",  "PBE"),
         ]
         for sym, name, cif, pp_file, pp_type, xc in materials_pseudos:
             self._safe_exec(
@@ -148,9 +199,11 @@ class KnowledgeGraph:
 
         # -- Systems --
         systems = [
-            ("Water",     '["H", "O"]',        300.0, "simple"),
-            ("Interface", '["O", "H", "C"]',   330.0, "complex"),
-            ("IrO2_Water", '["Ir", "O", "H"]', 300.0, ""),
+            ("Water",               '["H", "O"]',             300.0, "simple"),
+            ("Interface",           '["O", "H", "C"]',        330.0, "complex"),
+            ("IrO2_Water",          '["Ir", "O", "H"]',       300.0, ""),
+            # Upgrade 4: Anatase TiO2/Water interface — the primary restricted dataset system
+            ("Anatase_TiO2_Water",  '["Ti", "O", "H"]',       300.0, "complex"),
         ]
         for name, tmap, temp, style in systems:
             self._safe_exec(
@@ -201,13 +254,15 @@ class KnowledgeGraph:
                 "ON MATCH SET w.description = $description",
                 {"name": wf_name, "description": wf_desc},
             )
-            for step_name, step_desc in steps:
+            for order_idx, (step_name, step_desc) in enumerate(steps):
                 full_step = f"{wf_name}__{step_name}"
+                # Upgrade 4: Store step_order so get_workflow_steps() returns
+                # steps in exact execution sequence (not alphabetically)
                 self._safe_exec(
                     "MERGE (s:Step {name: $name}) "
-                    "ON CREATE SET s.script_template = $description, s.default_params = '' "
-                    "ON MATCH SET s.script_template = $description",
-                    {"name": full_step, "description": step_desc},
+                    "ON CREATE SET s.script_template = $description, s.default_params = $params, s.step_order = $step_order "
+                    "ON MATCH SET s.script_template = $description, s.default_params = $params, s.step_order = $step_order",
+                    {"name": full_step, "description": step_desc, "params": "", "step_order": order_idx},
                 )
                 self._safe_exec(
                     "MATCH (w:Workflow {name: $wf}), (s:Step {name: $step}) "
@@ -221,9 +276,11 @@ class KnowledgeGraph:
 
         # -- Link systems to workflows --
         system_workflows = [
-            ("Water",      ["dft", "training", "md", "analysis"]),
-            ("Interface",  ["training", "md", "analysis"]),
-            ("IrO2_Water", ["analysis"]),
+            ("Water",              ["dft", "training", "md", "analysis"]),
+            ("Interface",          ["training", "md", "analysis"]),
+            ("IrO2_Water",         ["analysis"]),
+            # Upgrade 4: Anatase TiO2/Water — restricted dataset analysed via Docker
+            ("Anatase_TiO2_Water", ["analysis"]),
         ]
         for sys_name, wfs in system_workflows:
             for wf in wfs:
@@ -238,6 +295,8 @@ class KnowledgeGraph:
             ("H", "Water"), ("O", "Water"),
             ("H", "Interface"), ("O", "Interface"), ("C", "Interface"),
             ("Ir", "IrO2_Water"), ("O", "IrO2_Water"), ("H", "IrO2_Water"),
+            # Upgrade 4: Anatase TiO2/Water material-system links
+            ("Ti", "Anatase_TiO2_Water"), ("O", "Anatase_TiO2_Water"), ("H", "Anatase_TiO2_Water"),
         ]
         for mat, sys_name in material_systems:
             self._safe_exec(
@@ -281,11 +340,16 @@ class KnowledgeGraph:
         return rows[0] if rows else None
 
     def get_workflow_steps(self, workflow_name: str) -> list[dict]:
-        """Get all steps for a workflow in order."""
+        """Get all steps for a workflow in execution order.
+
+        Upgrade 4: Orders by step_order (integer execution index) instead of
+        alphabetically by name, so the returned list reflects the actual pipeline
+        sequence (parse → generate → submit → parse → plot).
+        """
         return self.query(
             "MATCH (w:Workflow {name: $wf})-[:HAS_STEP]->(s:Step) "
-            "RETURN s.name AS name, s.script_template AS description "
-            "ORDER BY s.name",
+            "RETURN s.name AS name, s.script_template AS description, s.step_order AS step_order "
+            "ORDER BY s.step_order ASC",
             {"wf": workflow_name},
         )
 
@@ -302,17 +366,30 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------ #
 
     def _safe_exec(self, cypher: str, params: Optional[dict[str, Any]] = None) -> None:
-        """Execute a Cypher statement, ignoring 'already exists' errors."""
+        """Execute a Cypher statement, ignoring 'already exists' and 'already has property' errors."""
         try:
             self._conn.execute(cypher, parameters=params or {})
         except RuntimeError as exc:
-            if "already exists" in str(exc).lower():
+            msg = str(exc).lower()
+            if "already exists" in msg or "already has property" in msg or "already exist" in msg:
                 pass
             else:
                 raise
 
     def close(self) -> None:
-        """Close the database connection."""
-        # Kùzu Python API handles cleanup on GC, but explicit close is polite
-        self._conn = None  # type: ignore[assignment]
-        self._db = None  # type: ignore[assignment]
+        """Close the database connection cleanly to checkpoint WAL."""
+        try:
+            if self._conn is not None and hasattr(self._conn, "close"):
+                self._conn.close()
+        except Exception:
+            pass
+        finally:
+            self._conn = None  # type: ignore[assignment]
+
+        try:
+            if self._db is not None and hasattr(self._db, "close"):
+                self._db.close()
+        except Exception:
+            pass
+        finally:
+            self._db = None  # type: ignore[assignment]

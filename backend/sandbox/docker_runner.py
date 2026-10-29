@@ -32,11 +32,32 @@ class DockerRunner:
         self.cpu_limit = cpu_limit or settings.DOCKER_CPU_LIMIT
         self.data_dir = settings.backend_dir / "data"
 
+    def _find_docker_bin(self) -> str | None:
+        """Find Docker executable path with fallback to standard Docker Desktop locations."""
+        docker_bin = shutil.which("docker")
+        if docker_bin:
+            return docker_bin
+        
+        # Check standard installation locations on Windows
+        candidate_paths = [
+            Path(r"E:\Docker\Docker\resources\bin\docker.exe"),
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "DockerDesktop" / "resources" / "bin" / "docker.exe",
+            Path(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"),
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Docker" / "Docker" / "resources" / "bin" / "docker.exe",
+        ]
+        for candidate in candidate_paths:
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except Exception:
+                pass
+        return None
+
     def is_docker_available(self) -> Tuple[bool, str]:
         """Check if Docker CLI exists and the Docker daemon is responding."""
-        docker_bin = shutil.which("docker")
+        docker_bin = self._find_docker_bin()
         if not docker_bin:
-            return False, "Docker CLI not found on PATH. Please install Docker Desktop or enable Docker."
+            return False, "Docker CLI not found on PATH or standard locations. Please install Docker Desktop or enable Docker."
 
         try:
             res = subprocess.run(
@@ -62,9 +83,10 @@ class DockerRunner:
         if not is_avail:
             return False, msg
 
+        docker_bin = self._find_docker_bin() or "docker"
         try:
             res = subprocess.run(
-                ["docker", "image", "inspect", self.image_name],
+                [docker_bin, "image", "inspect", self.image_name],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -122,20 +144,36 @@ class DockerRunner:
                 "timed_out": False,
             }
 
+        docker_bin = self._find_docker_bin() or "docker"
+
         # Format paths for Docker volume mounting (Windows compatible)
         run_dir_abs = str(run_dir.resolve()).replace("\\", "/")
         data_dir_abs = str(self.data_dir.resolve()).replace("\\", "/")
         script_rel_name = script_file.name
 
+        # Highly secure container execution arguments:
+        # 1. --network none: Total network isolation (no internet, no local subnet)
+        # 2. --security-opt=no-new-privileges:true: Prevent privilege escalation
+        # 3. --cap-drop=ALL: Drop all Linux kernel capabilities
+        # 4. --pids-limit=100: Prevent fork bombs and thread starvation
+        # 5. --tmpfs /tmp:rw,noexec,nosuid,size=64m: Ephemeral non-executable /tmp
+        # 6. -v ...:/data:ro: Read-only dataset access (host data cannot be tampered with)
+        # 7. -v ...:/workspace:rw: Isolated run directory (only generated plots/summaries output here)
+        # 8. --user 1000:1000: Strictly unprivileged user execution
         cmd = [
-            "docker", "run",
+            docker_bin, "run",
             "--name", container_name,
             "--rm",
-            "--network", "none",                       # Network isolation: no outbound traffic
-            f"--memory={self.memory_limit}",           # Memory cap
-            f"--cpus={self.cpu_limit}",                # CPU cap
-            "-v", f"{run_dir_abs}:/workspace:rw",       # Output workspace
-            "-v", f"{data_dir_abs}:/data:ro",           # Read-only dataset access
+            "--network", "none",
+            "--security-opt=no-new-privileges:true",
+            "--cap-drop=ALL",
+            "--pids-limit=100",
+            f"--memory={self.memory_limit}",
+            f"--cpus={self.cpu_limit}",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--user", "1000:1000",
+            "-v", f"{run_dir_abs}:/workspace:rw",
+            "-v", f"{data_dir_abs}:/data:ro",
             "-w", "/workspace",
             "-e", "MPLBACKEND=Agg",
             "-e", "PYTHONIOENCODING=utf-8",
@@ -167,7 +205,7 @@ class DockerRunner:
             stderr = f"Execution timed out inside Docker container after {timeout_val} seconds."
             # Attempt to kill running container
             try:
-                subprocess.run(["docker", "kill", container_name], capture_output=True, timeout=5)
+                subprocess.run([docker_bin, "kill", container_name], capture_output=True, timeout=5)
             except Exception:
                 pass
 
